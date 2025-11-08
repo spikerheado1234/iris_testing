@@ -29,7 +29,7 @@ def alltoalldispatch_preamble(
                         should be routed from dev_other -> curr_dev. 
     META -> [m1, m2, ... mf] -> of size: num_experts. This determines the number of tokens routed to expert mi 
                                     from this device.
-    NUMS_flag -> This is an array of world_size (0 initialized) as flags to understand when comms have finished. 
+    NUMS_flag -> This is a unit-sized array which will symbolize when the comms has completed.
     This kernel should be launched with grid-size = NUM_EXPERTS, without this invariant, it will fail.
     """
     pid = tl.program_id(0)
@@ -49,16 +49,14 @@ def alltoalldispatch_preamble(
 
         ## Can we make this better? Use device_ids only and not anything else?
         if device_id == cur_rank:
-            tl.atomic_add(B+device_id, cnt)
-            tl.atomic_add(NUMS_flag, 1)
-        else:
             iris.atomic_add(
                 B + device_id, 
                 cnt,
                 cur_rank,
                 device_id,
                 heap_bases,
-                mask=None ## Should be a legal call since we're not doing anything special here.
+                mask=None, ## Should be a legal call since we're not doing anything special here.
+                sem="acq_rel",
                 )
             iris.atomic_add(
                 NUMS_flag,
@@ -66,8 +64,41 @@ def alltoalldispatch_preamble(
                 cur_rank,
                 device_id,
                 heap_bases,
-                mask=None
+                mask=None,
+                sem="acq_rel",
+                #scope="sys"
             )
+            #tl.atomic_add(B+device_id, cnt)
+            #tl.atomic_add(NUMS_flag, 1)
+        else:
+            iris.atomic_add(
+                B + device_id, 
+                cnt,
+                cur_rank,
+                device_id,
+                heap_bases,
+                mask=None, ## Should be a legal call since we're not doing anything special here.
+                sem="acq_rel",
+                scope="sys"
+                )
+            iris.atomic_add(
+                NUMS_flag,
+                1,
+                cur_rank,
+                device_id,
+                heap_bases,
+                mask=None,
+                sem="acq_rel",
+                scope="sys"
+            )
+
+    ## Is this needed since we synchronize using shmem.barier() later? ##
+    world_size_i32 = tl.full([], world_size, dtype=tl.int32)
+    while tl.load(NUMS_flag) <= world_size_i32:
+        pass
+    
+    last_flag_val = tl.load(NUMS_flag)
+    tl.device_print("flag_value at termination: ", last_flag_val)
 
 def alltoalldispatch_main(
     A, B, META, DATA_flag, stride_am, stride_ak
@@ -117,7 +148,7 @@ def callee(
 
 
     ## Instantiate shmem based heap regions over here. ##
-    NUMS_flag = shmem.zeros(num_experts)
+    NUMS_flag = shmem.zeros(1, dtype=torch.int32).to(tokens.device)
     device_cnts = shmem.zeros(world_size).to(tokens.device)
 
     ## First, we have to call an alltoall that will aggregrate token level information
@@ -128,13 +159,15 @@ def callee(
     ) 
 
     shmem.barrier()
+    print(f'flag values post kernel launch+sync: {NUMS_flag}')
     ## Let's print device_cnts at the end. ##
+    print(f'device_cnts: {device_cnts}')
 
-    ## Next, we instantiate token buffers accordingly for the next phase of the all-to-all + gemm.
+    ## Next, we instantiate token buffers accordingly for the next phase of the all-to-all + gemm. ##
     routed_token_buffer = shmem.zeros(int(round(device_cnts.sum().item())), tokens.shape[-1])
     s1 = torch.cuda.Stream()
     s2 = torch.cuda.Stream()
-    ## Now, we launch the main all-to-all kernel + persistent gemm.
+    ## Now, we launch the main all-to-all kernel + persistent gemm. ##
     with torch.cuda.stream(s1):
         ## Call the main all-to-all over here that transmits the data. ##
         pass
@@ -148,7 +181,7 @@ def callee(
 
 if __name__ == "__main__":
     ## Input parameters. ##
-    world_size, batch, seq, hidden_dim = 2, 2, 2, 4  
+    world_size, batch, seq, hidden_dim = 4, 8, 2, 4
     num_experts = world_size * 2
     ## A custom test case for convenience. ##
     mp.spawn(callee, args=(batch, seq, hidden_dim, num_experts, world_size), nprocs=world_size, join=True)
