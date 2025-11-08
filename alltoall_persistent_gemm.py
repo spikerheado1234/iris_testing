@@ -15,30 +15,6 @@ import sys
 import os
 
 import iris
-"""
-First exchange token size data.
-
-## We set number of blocks to number of devices to send the information to.
-
-Suppose we have the following experts:
-Ex1, Ex2, Ex3, Ex4.
-
-1 & 2 on one device.
-
-3 & 4 on one device.
-
-We should launch two blocks.
-
-On device 0:
-block 1 transmits the information to "local" (alt. also recieves stuff locally).
-
-block 2 transmits the information to device 2 (alt. also recieves stuff locally).
-
-We must use iris.atomic_adds for convenience.
-
-
-NUMS_global -> array consisting of integers that determine the number of tokens routed to an expert from this TB (dev.).
-"""
 @triton.jit
 def alltoalldispatch_preamble(
     A, B, META, NUMS_flag, heap_bases,
@@ -58,7 +34,6 @@ def alltoalldispatch_preamble(
     """
     pid = tl.program_id(0)
     ## Let's code a little defensively for now. ##
-    tl.device_assert(world_size == tl.num_programs(0))
     tl.device_assert(NUM_EXPERTS % EP_SIZE == 0)
 
     for device_id in tl.range(world_size):
@@ -70,7 +45,7 @@ def alltoalldispatch_preamble(
 
         ## Extract the count. ##
         ptrs = tl.arange(0, chunk_size) + chunk_size * device_id
-        cnt = tl.sum(tl.load(META + ptrs, mask= ptrs < world_size))
+        cnt = tl.sum(tl.load(META + ptrs, mask=ptrs<NUM_EXPERTS))
 
         ## Can we make this better? Use device_ids only and not anything else?
         if device_id == cur_rank:
@@ -138,25 +113,25 @@ def callee(
     heap_size = 2**30 ## 1 GiB symmetric heap.
     shmem = iris.iris(heap_size)
     tokens, meta = gen_tensor(batch, seq, hidden_dim, world_size, num_experts, rank)
+    print(f'meta: {meta}')
 
-    device_cnts = torch.zeros(world_size).to(tokens.device)
 
     ## Instantiate shmem based heap regions over here. ##
     NUMS_flag = shmem.zeros(num_experts)
+    device_cnts = shmem.zeros(world_size).to(tokens.device)
 
     ## First, we have to call an alltoall that will aggregrate token level information
     ##   to instantiate buffer sizes.
-    alltoalldispatch_preamble[(world_size,1,1)](
+    alltoalldispatch_preamble[(1,1,1)](
         tokens, device_cnts, meta, NUMS_flag, shmem.get_heap_bases(), 
         dist.get_rank(), world_size, num_experts, tokens.shape[0], num_experts // world_size 
     ) 
 
-    iris.barrier()
+    shmem.barrier()
     ## Let's print device_cnts at the end. ##
-    print(device_cnts)
 
     ## Next, we instantiate token buffers accordingly for the next phase of the all-to-all + gemm.
-    routed_token_buffer = shmem.zeros(device_cnts.sum(), tokens.shape[-1])
+    routed_token_buffer = shmem.zeros(int(round(device_cnts.sum().item())), tokens.shape[-1])
     s1 = torch.cuda.Stream()
     s2 = torch.cuda.Stream()
     ## Now, we launch the main all-to-all kernel + persistent gemm.
