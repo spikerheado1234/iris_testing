@@ -1,7 +1,3 @@
-"""
-A lot of this code is taken from: 
-https://github.com/ROCm/iris/blob/main/examples/07_gemm_all_scatter/gemm_all_scatter.py
-"""
 import torch.multiprocessing as mp
 import torch
 import torch.distributed as dist
@@ -17,7 +13,7 @@ import os
 
 import iris
 
-## Experimental preamble to enable a more general and unbalanced a2a.
+## Experimental preamble to enable a more general and unbalanced a2a. Currently a WIP. ##
 @triton.jit
 def alltoalldispatch_preamble(
     A, B, META, NUMS_flag, heap_bases,
@@ -88,7 +84,7 @@ def alltoalldispatch_main(
     token_cnt: tl.constexpr, outgoing_buffer_size: tl.constexpr,
     hidden_dim: tl.constexpr, transmit_size: tl.constexpr, 
     cur_rank: tl.constexpr, world_size: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr, EP_SIZE: tl.constexpr 
+    NUM_EXPERTS: tl.constexpr, EP_SIZE: tl.constexpr, BLOCK_SIZE: tl.constexpr 
 ):
     """
     This is the main kernel that physically transmits the data over.
@@ -100,23 +96,27 @@ def alltoalldispatch_main(
     """
 
     pid = tl.program_id(0)
-    num_progs = tl.num_programs(0)
-
-    #ptrs = tl.arange(0, transmit_size)[:, None] * stride_am + tl.arange(0, hidden_dim)[None, :] * stride_ak
-    non_local_ptrs = tl.arange(0, transmit_size)[:, None] * stride_am + tl.arange(0, hidden_dim)[None, :] * stride_ak + cur_rank * transmit_size * stride_am
-
-    ## Optimise this out into multiple blocks once finished base implementation with correctness tested. ##
     device_id = pid
-    ptrs = tl.arange(0, transmit_size)[:, None] * stride_am + tl.arange(0, hidden_dim)[None, :] * stride_ak + device_id * transmit_size * stride_am
-    #for device_id in tl.range(world_size):
-    iris.put(
-        input_dev_tokens + ptrs,
-        routed_token_buffer + non_local_ptrs,
-        cur_rank,
-        device_id,
-        heap_bases,
-        mask=tl.arange(0, transmit_size)[:, None] + cur_rank < outgoing_buffer_size, 
-        )
+    num_progs = tl.num_programs(0)
+    tl.device_assert(transmit_size % BLOCK_SIZE == 0)
+
+    non_local_ptrs = tl.arange(0, BLOCK_SIZE)[:, None] * stride_am + tl.arange(0, hidden_dim)[None, :] * stride_ak + cur_rank * transmit_size * stride_am
+    ptrs = tl.arange(0, BLOCK_SIZE)[:, None] * stride_am + tl.arange(0, hidden_dim)[None, :] * stride_ak + device_id * transmit_size * stride_am
+
+    for iter in tl.range(tl.cdiv(transmit_size, BLOCK_SIZE)):
+        iris.put(
+            input_dev_tokens + ptrs,
+            routed_token_buffer + non_local_ptrs,
+            cur_rank,
+            device_id,
+            heap_bases,
+            mask=tl.arange(0, BLOCK_SIZE)[:, None] + cur_rank < outgoing_buffer_size, 
+            )
+
+        non_local_ptrs += BLOCK_SIZE * stride_am
+        ptrs += BLOCK_SIZE * stride_am
+    
+    ## We have to incr the atomic flag only once at the end once the shift is successful. ##
     iris.atomic_add(
         DATA_flag,
         1,
@@ -128,15 +128,10 @@ def alltoalldispatch_main(
         scope="sys" 
     )
 
-    #world_size_i32 = tl.full([], world_size, dtype=tl.int32)
-    #while tl.load(DATA_flag) != world_size_i32:
-    #    pass
-
-
-def callee(
-    rank: int, batch: int, seq: int, hidden_dim: int, num_experts: int,
-    world_size: int, general_a2a: bool 
-    ):
+def run(
+    rank: int, tokens: torch.tensor, meta: torch.tensor, batch: int, seq: int, hidden_dim: int, num_experts: int,
+    world_size: int, shmem, general_a2a: bool 
+):
     """
     This is the callee function for the Shmem-based all-to-all + gemm kernels.
 
@@ -145,19 +140,6 @@ def callee(
     general_a2a: Flag to trigger unbalanced a2a capability, currently not working.
     """
     device_id = rank % torch.cuda.device_count()
-    dist.init_process_group(
-        backend="nccl",
-        rank=rank,
-        world_size=world_size,
-        init_method="tcp://127.0.0.1:29500",
-        device_id=torch.device(f"cuda:{device_id}")
-    )
-    heap_size = 2**30 ## 1 GiB symmetric heap.
-    shmem = iris.iris(heap_size)
-    tokens, meta = gen_tensor(
-        batch, seq, hidden_dim, 
-        world_size, num_experts, 
-        rank)
 
     if general_a2a:
         ## Instantiate shmem based heap regions over here. ##
@@ -190,21 +172,12 @@ def callee(
             tokens.stride(0), tokens.stride(1), shmem.get_heap_bases(), 
             tokens.shape[0], transmit_size * world_size, 
             tokens.shape[-1], transmit_size, rank, 
-            world_size, num_experts, world_size
+            world_size, num_experts, world_size, BLOCK_SIZE=256  ## Temporarily put 256 but autotune out in the future.
         )
     with torch.cuda.stream(s2):
         ## Call the persistent Gemm here that does the MLP compute. ##
-        pass
+        NUM_REM_SMS = 100 - world_size
 
-    s1.synchronize()
-    s2.synchronize()
+    torch.cuda.synchronize()
     shmem.barrier()
-    print(f'[rank: {rank}], routed_token_buffer sum: {routed_token_buffer.sum()}')
-    dist.destroy_process_group()
-
-if __name__ == "__main__":
-    ## Input parameters. ##
-    world_size, batch, seq, hidden_dim = 8, 8, 4, 4
-    num_experts = world_size * 2
-    ## A custom test case for convenience. ##
-    mp.spawn(callee, args=(batch, seq, hidden_dim, num_experts, world_size, False), nprocs=world_size, join=True)
+    #print(f'[rank: {rank}], summed tensor: {routed_token_buffer.sum()}')
