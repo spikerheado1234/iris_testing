@@ -14,11 +14,8 @@ def run(
     if general_a2a:
         pass ## Not implemented yet. ##
     else:
-        assert tokens.shape[0] % world_size == 0, 'Incorrect sizes passed in.'
-        transmit_size = tokens.shape[0] // world_size
-        tokens_resh = list(torch.tensor_split(tokens, world_size, dim=0))
-        tokens_recv = [torch.zeros(transmit_size, tokens.shape[-1], dtype=tokens.dtype).to("cuda" if torch.cuda.is_available() else "cpu") for _ in range(world_size)]
-        dist.all_to_all(tokens_recv, tokens_resh)
+        tokens_recv = [torch.zeros(i.shape[0] * world_size, i.shape[-1], dtype=i.dtype).to("cuda" if torch.cuda.is_available() else "cpu") for i in tokens]
+        dist.all_to_all(tokens_recv, tokens)
 
         torch.cuda.synchronize()
         #print(f'[rank: {rank}], summed token buffer: {sum([i.sum() for i in tokens_recv])}')

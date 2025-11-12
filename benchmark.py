@@ -18,7 +18,7 @@ import iris
 
 def callee(
     rank: int, batch: int, seq: int, hidden_dim: int, num_experts: int,
-    world_size: int, opt: bool 
+    world_size: int, topk: int, opt: bool 
     ):
     """
     This is the callee function for the Shmem-based all-to-all + gemm kernels.
@@ -39,22 +39,24 @@ def callee(
     heap_size = (2**30)*18 ## 1 GiB symmetric heap.
     shmem = iris.iris(heap_size)
 
-    tokens, meta = gen_tensor(
+    tokens = gen_tensor(
         batch, seq, hidden_dim, 
         world_size, num_experts, 
-        rank)
+        rank, topk)
 
     ## Warmup. ##
     for _ in range(5):
         if opt:
+            ## Currently meta is an empty list. Will be required for uneven all-to-all later. ##
             CustomA2A(
-                rank, tokens, meta, batch, 
+                rank, tokens, [], batch, 
                 seq, hidden_dim, num_experts, 
                 world_size, shmem, False
                 )
         else:
+            ## Currently meta is an empty list. Will be required for uneven all-to-all later. ##
             TorchA2A(
-                rank, tokens, meta, batch,
+                rank, tokens, [], batch,
                 seq, hidden_dim, num_experts,
                 world_size, False, shmem
                 )
@@ -65,13 +67,13 @@ def callee(
     for _ in range(10):
         if opt:
             CustomA2A(
-                rank, tokens, meta, batch, 
+                rank, tokens, [], batch, 
                 seq, hidden_dim, num_experts, 
                 world_size, shmem, False
                 )
         else:
             TorchA2A(
-                rank, tokens, meta, batch,
+                rank, tokens, [], batch,
                 seq, hidden_dim, num_experts,
                 world_size, False, shmem
                 )
@@ -84,8 +86,8 @@ def callee(
 
 if __name__ == "__main__":
     ## Input parameters. ##
-    world_size, batch, seq, hidden_dim = 8, 8, 65536, 1024
-    num_experts = world_size * 2
-    run_custom_a2a: bool = True 
+    world_size, batch, seq, hidden_dim, topk = 8, 8, 4096, 1024, 2
+    num_experts = world_size * 2  ## Two experts per device. ##
+    run_custom_a2a: bool = False 
     ## A custom test case for convenience. ##
-    mp.spawn(callee, args=(batch, seq, hidden_dim, num_experts, world_size, run_custom_a2a), nprocs=world_size, join=True)
+    mp.spawn(callee, args=(batch, seq, hidden_dim, num_experts, world_size, topk, run_custom_a2a), nprocs=world_size, join=True)
