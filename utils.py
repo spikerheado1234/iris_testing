@@ -32,6 +32,54 @@ def build_expert_offsets(send_counts: torch.Tensor) -> torch.Tensor:
 
 
 @dataclass
+class ShmemBuffers:
+    # Step-1 outputs / sync
+    pca: torch.Tensor  # [E, world] int32 (symmetric)
+    counts_ready: torch.Tensor  # [1] int32 (symmetric)
+
+    # Step-2 outputs / sync
+    token_buf: torch.Tensor  # [E, world, CAP, H] (symmetric)
+    token_sync: torch.Tensor  # [E] int32 (symmetric)
+
+    # Cached heap bases (IRIS addressing)
+    heap_bases: torch.Tensor
+
+    
+def alloc_shmem_buffers(
+    shmem,
+    world_size: int,
+    e_local: int,
+    capacity: int,
+    hidden_dim: int,
+    token_dtype: torch.dtype,
+) -> ShmemBuffers:
+    """
+    Allocate symmetric buffers with fixed shapes.
+    """
+
+    # pca[e, src] = counts for this device's local expert e sent by src
+    pca = shmem.zeros((e_local, world_size), dtype=torch.int32, device="cuda")
+
+    # counts_ready becomes == world_size once all senders finished writing counts.
+    counts_ready = shmem.zeros((1,), dtype=torch.int32, device="cuda")
+
+    # token_buf[e, src, m, :] (m in [0, CAP)) holds tokens from src for expert e.
+    token_buf = shmem.zeros((e_local, world_size, capacity, hidden_dim), dtype=token_dtype, device="cuda")
+
+    # token_sync[e] becomes == world_size once all senders finished sending tokens for expert e.
+    token_sync = shmem.zeros((e_local,), dtype=torch.int32, device="cuda")
+
+    heap_bases = shmem.get_heap_bases()
+
+    return ShmemBuffers(
+        pca=pca,
+        counts_ready=counts_ready,
+        token_buf=token_buf,
+        token_sync=token_sync,
+        heap_bases=heap_bases,
+    )
+    
+@dataclass
 class CountsBuffers:
     pca: torch.Tensor
     counts_ready: torch.Tensor

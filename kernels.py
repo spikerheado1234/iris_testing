@@ -134,7 +134,7 @@ def tokens_exchange_kernel(
     )
 
     
-
+"""
 @triton.jit
 def token_shuffle(
     pca_cumsum_ptr, pca_ptr, ## Both of size: [E, world_size]
@@ -146,24 +146,24 @@ def token_shuffle(
     BLOCK_X: tl.contexpr  ## We have 1-d blocks only.
 ):
     """
-    Triton kernel that reshuffles data post all-to-all (prior to expert compute) 
-    to eliminate zero-padding.
+    #Triton kernel that reshuffles data post all-to-all (prior to expert compute) 
+    #to eliminate zero-padding.
 
-    Args:
-        pca_cumsum_ptr (Tensor): [E, world_size]-sized physical counts array. 
-            pca_cumsum_ptr[i, j] = x means x tokens 
-        pca_ptr (Tensor): [E, world_size]-sized physical counts array.
-            pca_ptr[i, j] = x represents that x tokens are routed from device j
-            to expert i on the current rank.
-        token_buffer_ptr (Tensor): [E, world_size, capacity, hidden_dim]-sized tensor.
-            the output buffer that the all-to-all writes to.
-        token_sync_ptr (Tensor): [E]-sized tensor. These are synchronization variables
-            set by the prior all-to-all to ensure correctness.
-        E (int): number of *local* experts.
-        world_size (int): number of participating ranks.
-        mxa (int): maximum capaicty (2nd dimension of the token_buffer_ptr array).
-        hidden_dim (int): token hidden-dimensions.
-    """
+    #Args:
+    #    pca_cumsum_ptr (Tensor): [E, world_size]-sized physical counts array. 
+    #        pca_cumsum_ptr[i, j] = x means x tokens 
+    #    pca_ptr (Tensor): [E, world_size]-sized physical counts array.
+    #        pca_ptr[i, j] = x represents that x tokens are routed from device j
+    #        to expert i on the current rank.
+    #    token_buffer_ptr (Tensor): [E, world_size, capacity, hidden_dim]-sized tensor.
+    #        the output buffer that the all-to-all writes to.
+    #    token_sync_ptr (Tensor): [E]-sized tensor. These are synchronization variables
+    #        set by the prior all-to-all to ensure correctness.
+    #    E (int): number of *local* experts.
+    #    world_size (int): number of participating ranks.
+    #    mxa (int): maximum capaicty (2nd dimension of the token_buffer_ptr array).
+    #    hidden_dim (int): token hidden-dimensions.
+"""
     expert = tl.program_id(0)
     dev_id = tl.program_id(1)
     token_id = tl.program_id(2)
@@ -211,20 +211,20 @@ def grouped_gemm(
     BLOCK_SIZE_K: tl.constexpr,
 ):
     """
-    This kernel implements a grouped-gemm on the input token-buffers.
+    #This kernel implements a grouped-gemm on the input token-buffers.
 
-    Args:
-        token_ptrs (Tensor): [S, hidden_dim]-sized array. S is the packed
-            number of tokens (no zero-padding) post data-shuffling.
-        expert_weights (Tensor): [hidden_dim, expert_hidden_dim]-sized array. 
-            This represents each experts' weights.
-        output_ptrs (Tensor): [S, expert_hidden_dim]-sized array. Buffer to store
-            the results of processing the input tokens with expert weights.
-        expert_tkn_cnt_ptr (Tensor): [E]-sized array representing the tokens routed 
-            to expert i on the current rank. 
+    #Args:
+    #    token_ptrs (Tensor): [S, hidden_dim]-sized array. S is the packed
+    #        number of tokens (no zero-padding) post data-shuffling.
+    #    expert_weights (Tensor): [hidden_dim, expert_hidden_dim]-sized array. 
+    #        This represents each experts' weights.
+    #    output_ptrs (Tensor): [S, expert_hidden_dim]-sized array. Buffer to store
+    #        the results of processing the input tokens with expert weights.
+    #    expert_tkn_cnt_ptr (Tensor): [E]-sized array representing the tokens routed 
+    #        to expert i on the current rank. 
         
-        Rest of the arguments are self-explanatory.
-    """
+    #    Rest of the arguments are self-explanatory.
+"""
     tile_idx = tl.program_id(0)
     last_problem_end = 0
     for g in range(expert_cnt):
@@ -275,5 +275,6 @@ def grouped_gemm(
 
         # get ready to go to the next gemm problem
         last_problem_end = last_problem_end + num_tiles
+    """
 
 

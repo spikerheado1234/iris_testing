@@ -4,8 +4,8 @@ import torch.distributed as dist
 # from .kernels import counts_exchange_kernel, tokens_exchange_kernel, build_expert_offsets
 
 
-from .kernels import counts_exchange_kernel, tokens_exchange_kernel
-from .utils import build_expert_offsets, _assert_cuda_int32
+from ..kernels import counts_exchange_kernel, tokens_exchange_kernel
+from ..utils import build_expert_offsets, _assert_cuda_int32
 
 class AllToAllOp(torch.autograd.Function):
     
@@ -77,7 +77,7 @@ class AllToAllOp(torch.autograd.Function):
         world_size = dist.get_world_size()
         rank = dist.get_rank()
 
-        assert experts % world_size, 'EP-group size unevenly calculated.'
+        assert experts % world_size == 0, 'EP-group size unevenly calculated.'
 
         e_local = experts // world_size
         hidden_dim = tokens.shape[-1]

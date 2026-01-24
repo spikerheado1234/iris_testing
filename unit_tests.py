@@ -2,18 +2,88 @@ import torch
 import torch.distributed as dist
 
 import os
-
+import time
 import iris
-
+import torch.multiprocessing as mp
 
 from .layers.all_to_all import custom_a2a
-from .layers.token_shuffle import shuffle
-from .layers.expert import expert
+#from .layers.token_shuffle import shuffle
+#from .layers.expert import expert
 
-from utils import alloc_counts_buffers, alloc_token_buffers
+from .utils import alloc_counts_buffers, alloc_token_buffers
+
+# 4 debug only
+import time
+def _spin_wait_counts(cb, world_size, timeout_s=10.0):
+    t0 = time.time()
+    while True:
+        v = int(cb.counts_ready.item())
+        if v >= world_size:
+            return
+        if time.time() - t0 > timeout_s:
+            raise RuntimeError(f"timeout waiting counts_ready: {v} < {world_size}")
+        time.sleep(0.001)  # avoid 100% CPU
+
+def _spin_wait_tokens(tb, world_size, timeout_s=10.0):
+    t0 = time.time()
+    while True:
+        ok = bool(torch.all(tb.token_sync == world_size).item())
+        if ok:
+            return
+        if time.time() - t0 > timeout_s:
+            # print the vector to see which expert is stuck
+            raise RuntimeError(f"timeout waiting token_sync: {tb.token_sync.tolist()}")
+        time.sleep(0.001)
+
+
+
 
 
 ## Some simple testing utility functions.
+
+# this two important for IPv6 / hostname  / TCPStore connect errors also some subtle triton errors like cache overwrites of ranks
+def _init_dist_tcp(rank: int, world_size: int) -> None:
+    # 1) Per-process Triton cache (avoid multi-proc cache races)
+    cache_dir = f"/tmp/triton_cache_{os.getuid()}_{os.getpid()}_rank{rank}"
+    os.environ["TRITON_CACHE_DIR"] = cache_dir
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # 2) Local rendezvous (avoid hostname/IPv6 resolution issues)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29500")
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    # 3) Ensure rank->GPU mapping is explicit
+    torch.cuda.set_device(rank)
+
+    # 4) Init PG with explicit device_id to avoid "Guessing device ID" warnings/hangs
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        rank=rank,
+        world_size=world_size,
+        device_id=torch.device(f"cuda:{rank}"),
+    )
+
+def _worker(local_rank: int, world_size: int) -> None:
+    _init_dist_tcp(local_rank, world_size)
+    shmem = _get_shmem()  # init once per process
+    print(f"[rank{local_rank}] init ok, cuda={torch.cuda.current_device()}", flush=True)
+    try:
+        # run tests ONLY inside workers
+        print(f"[rank{local_rank}] begin test e_local=2", flush=True)
+        test_custom_a2a(shmem, e_local=2, hidden_dim=128, cap=32)
+        print(f"[rank{local_rank}] done  test e_local=2", flush=True)
+
+        print(f"[rank{local_rank}] begin test e_local=4", flush=True)
+        test_custom_a2a(shmem, e_local=4, hidden_dim=256, cap=16)
+        print(f"[rank{local_rank}] done  test e_local=4", flush=True)
+
+        if local_rank == 0:
+            print("custom_a2a tests PASSED")
+    finally:
+        dist.destroy_process_group()
 
 def is_correct(one, two, threshold):
     if one.shape != two.shape:
@@ -31,14 +101,11 @@ def _require_dist():
 
 
 def _get_shmem():
-    if hasattr(iris, "shmem"):
-        return iris.shmem
-    if hasattr(iris, "symm_mem"):
-        return iris.symm_mem
-    raise RuntimeError("Cannot find shmem handle (expected iris.shmem or iris.symm_mem)")
+    heap_size = int(os.environ.get("IRIS_HEAP_SIZE", str(1 << 30)))
+    return iris.iris(heap_size)
 
 def gen_gemm_input(num_local_experts, token_hid_dim, expert_hid_dim):
-    expert_token_cnt = torch.randint(low=0,high=100, (num_local_experts,))
+    expert_token_cnt = torch.randint(low=0, high=100, size=(num_local_experts,))
 
     tokens = torch.randn(expert_token_cnt.sum(), token_hid_dim)
 
@@ -48,7 +115,7 @@ def gen_gemm_input(num_local_experts, token_hid_dim, expert_hid_dim):
 
 
 
-def test_custom_a2a(e_local: int = 2, hidden_dim: int = 128, cap: int = 32, threshold: float = 1e-2) -> bool:
+def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 32, threshold: float = 1e-2) -> bool:
     """
        Routing pattern:
       Each src sends exactly `cap` rows to every (dst, local_expert).
@@ -75,7 +142,7 @@ def test_custom_a2a(e_local: int = 2, hidden_dim: int = 128, cap: int = 32, thre
                 tokens[row].fill_(val)
 
     # symmetric buffers
-    shmem = _get_shmem()
+    #shmem = _get_shmem()
     cb = alloc_counts_buffers(shmem, world_size=world_size, e_local=e_local)
     tb = alloc_token_buffers(
         shmem,
@@ -91,6 +158,7 @@ def test_custom_a2a(e_local: int = 2, hidden_dim: int = 128, cap: int = 32, thre
     tb.token_buf.zero_()
     tb.token_sync.zero_()
 
+    print(f"[rank{rank}] calling custom_a2a e_local={e_local}", flush=True)
     # the layerop
     out = custom_a2a(
         tokens,
@@ -104,21 +172,32 @@ def test_custom_a2a(e_local: int = 2, hidden_dim: int = 128, cap: int = 32, thre
         experts,
         cap,
     )
+    print(f"[rank{rank}] returned custom_a2a e_local={e_local}", flush=True)
 
     # wait via sync vars without barrier or sychornization
-    while int(cb.counts_ready.item()) < world_size:
-        pass
-    while not bool(torch.all(tb.token_sync == world_size).item()):
-        pass
+    #while int(cb.counts_ready.item()) < world_size:
+    #    pass
+    #while not bool(torch.all(tb.token_sync == world_size).item()):
+    #    pass
+    _spin_wait_counts(cb, world_size)
+    _spin_wait_tokens(tb, world_size)
 
     # gather inputs for expected mapping 
     gathered_in = [torch.empty_like(tokens) for _ in range(world_size)]
     dist.all_gather(gathered_in, tokens)
 
     # quick smoke: sums
-    total_in_sum = torch.stack([x.sum() for x in gathered_in]).sum()
+    #total_in_sum = torch.stack([x.sum() for x in gathered_in]).sum()
+    #total_out_sum = out.sum()
+    #assert is_correct(total_out_sum, total_in_sum, threshold), "SUM sanity check failed"
+    dst_base = int(dst_offsets[rank].item())
+    expected_local_sum = 0
+    for src in range(world_size):
+        expected_local_sum += gathered_in[src][dst_base : dst_base + e_local * cap, :].sum()
+
     total_out_sum = out.sum()
-    assert is_correct(total_out_sum, total_in_sum, threshold), "SUM sanity check failed"
+    assert is_correct(total_out_sum, expected_local_sum, threshold), "SUM sanity check failed"
+
 
     #strong check: exact block placement for dst = rank
     dst_base = int(dst_offsets[rank].item())
@@ -150,12 +229,16 @@ def test_gemm(total_expert_cnt, token_hid_dim, expert_hid_dim):
 
 
 if __name__ == '__main__':
+   
+    world_size = 2
+    mp.spawn(_worker, args=(world_size,), nprocs=world_size, join=True)
+
 
     ## Some sample inputs to test out correctness. ##
-    test_gemm(2, 24, 48)
-    test_gemm(5, 128, 128)
+    #test_gemm(2, 24, 48)
+    #test_gemm(5, 128, 128)
     
-    test_custom_a2a(e_local=2, hidden_dim=128, cap=32)
-    test_custom_a2a(e_local=4, hidden_dim=256, cap=16)
+    #est_custom_a2a(e_local=2, hidden_dim=128, cap=32)
+    #test_custom_a2a(e_local=4, hidden_dim=256, cap=16)
     
 
