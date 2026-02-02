@@ -4,7 +4,7 @@ import triton
 # from .kernels import counts_exchange_kernel, tokens_exchange_kernel, build_expert_offsets
 
 
-from kernels import counts_exchange_kernel, tokens_exchange_tiles_fused_kernel
+from kernels import counts_exchange_kernel, tokens_exchange_kernel
 from utils import build_expert_offsets, _assert_cuda_int32
 
 
@@ -97,15 +97,13 @@ class AllToAllOp(torch.autograd.Function):
         )
         
         
-        # Stage-2: token exchange
-        #
-        # IMPORTANT: avoid dest_counts.max().item() here (device->host sync).
-        BLOCK_M = 8
-        expert_offs = build_expert_offsets(dest_counts)  # prefix offsets per (dst, expert) within this rank's packed send payload
-        max_tiles = (capacity + BLOCK_M - 1) // BLOCK_M  # ceil(CAP / BLOCK_M)
-        max_tiles = max(1, int(max_tiles))
+       # Stage-2: token exchange (per-token blocks)
+        BLOCK_K = 128
 
-        tokens_exchange_tiles_fused_kernel[(world_size, e_local, max_tiles)](
+        expert_offs = build_expert_offsets(dest_counts)  # 还是需要它
+        tile_counter.zero_()
+        # grid 第三维直接用 CAP（不用 dest_counts.max().item()，也不用 max_tiles）
+        tokens_exchange_kernel[(world_size, e_local, capacity)](
             tokens, dest_counts, dst_offsets, expert_offs,
             token_buf, token_sync, tile_counter, heap_bases,
             src_rank=rank,
@@ -113,11 +111,9 @@ class AllToAllOp(torch.autograd.Function):
             e_local=e_local,
             CAP=capacity,
             hidden_dim=hidden_dim,
-            BLOCK_M=BLOCK_M,
-            BLOCK_K=256,
-            num_warps=8,
+            BLOCK_K=BLOCK_K,
+            num_warps=4,   
         )
-
         #return only the layer output (token_buf).
         return token_buf
 

@@ -33,24 +33,26 @@ def counts_exchange_kernel(
     """Write counts to each dst's PCA[:, src_rank], then signal counts_ready++ on dst."""
 
     dst = tl.program_id(0)  # one program per destination rank
-   
+    ## 取 Triton grid 的第 0 维 program id，作为 目的 rank（destination rank）意味着：本 kernel 的 launch 网格是 grid = (world_size,)，每个 program 专门负责一个 dst。
     
 
     # Write the E counts for this destination.
     for e0 in tl.static_range(0, e_local, BLOCK_E):
         e = e0 + tl.arange(0, BLOCK_E)
         mask_e = e < e_local
-       
+        ##构造当前块内的 expert 索引向量：tl.arange(0, BLOCK_E) 是 [0, 1, 2, ..., BLOCK_E-1]加上 e0 后变成 [e0, e0+1, ..., e0+BLOCK_E-1]
+        ##生成一个布尔 mask，标记当前块里哪些 e 是合法的（没有越界）。
 
         # Local read: send_counts[dst, e]
         #vals = tl.load(send_counts_ptr + dst * e_local + e, mask=mask_e, other=0).to(tl.int32)
 
         # Remote write: pca[e, src_rank] on destination.
-        src_ptr = send_counts_ptr + dst * e_local + e  
-        remote_ptr = pca_ptr + e * world_size + src_rank 
-                    
-                  
-        iris.put(  
+        src_ptr = send_counts_ptr + dst * e_local + e  # new pointer 计算 src 端本地内存中 send_counts[dst, e] 的地址（向量地址）。
+        remote_ptr = pca_ptr + e * world_size + src_rank #r计算 dst 端对称内存 pca[e, src_rank] 的地址（也是向量地址）。
+                    #pca layout 是 [e_local, world_size]（你注释写 [E, world]）：
+                    #e * world_size：跳到第 e 行
+                    # src_rank：该行里第 src_rank 列
+        iris.put(  #写入对称堆，确保只写有用的元素
             src_ptr,            # from_ptr: pointer
             remote_ptr,         # to_ptr: pointer
             from_rank=src_rank,
@@ -59,9 +61,10 @@ def counts_exchange_kernel(
             heap_bases=heap_bases,
             mask=mask_e,        
         )
-      
+        ##对本地 expert 维度 e_local 做分块循环，块大小 BLOCK_E。tl.static_range 表示 编译期展开（loop unrolling），生成多个固定次数的块。
+
     # Signal completion to destination (release semantics).
-    iris.atomic_add( 
+    iris.atomic_add( #告诉dst完成
         counts_ready_ptr,
         1,
         src_rank,
@@ -72,16 +75,16 @@ def counts_exchange_kernel(
     )
     # spin wait on elocal variables that waits
 
-# Step-2 kernel: token exchange (with local spin-wait on counts_ready) which in the run may cause busy wait right
+# Step-2 kernel: token exchange with the original logic
 @triton.jit
-def tokens_exchange_tiles_fused_kernel(
+def tokens_exchange_kernel(
     send_ptr,            # [sum_send, H]
     send_counts_ptr,     # [W, E] int32 local
     dst_offsets_ptr,     # [W] int32 local
-    expert_offs_ptr,     # [W, E] int32 local
+    expert_offs_ptr,     # [W, E] int32 local (prefix within dst block)
     token_buf_ptr,       # [E, W, CAP, H] symmetric on dst
     token_sync_ptr,      # [E] int32 symmetric on dst
-    tile_counter_ptr,    # [E, W] int32 symmetric on dst   <--- NEW
+    tile_counter_ptr,    # [E, W] int32 LOCAL scratch on src (we repurpose it!)
     heap_bases,
     #*,
     src_rank: tl.constexpr,
@@ -89,21 +92,19 @@ def tokens_exchange_tiles_fused_kernel(
     e_local: tl.constexpr,
     CAP: tl.constexpr,
     hidden_dim: tl.constexpr,
-    BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    dst    = tl.program_id(0) 
-    expert = tl.program_id(1) 
-    pid_m  = tl.program_id(2)  
+    # grid = (dst, expert, token_id)
+    dst    = tl.program_id(0)
+    expert = tl.program_id(1)
+    tid    = tl.program_id(2)  # token row id within this (dst, expert)
 
+    # how many rows to send to (dst, expert)
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
-
-    # Clamp to CAP to avoid OOB if caller didn't skip overflow
     n_eff = tl.minimum(n, tl.full((), CAP, tl.int32))
 
-
-
-    if pid_m == 0:
+    # If no tokens: ONE program (tid==0) sends completion signal.
+    if tid == 0:
         if n_eff == 0:
             iris.atomic_add(
                 token_sync_ptr + expert, 1,
@@ -112,28 +113,26 @@ def tokens_exchange_tiles_fused_kernel(
             )
             return
 
-    expected_tiles = (n_eff + (BLOCK_M - 1)) // BLOCK_M
-    if pid_m >= expected_tiles:
+    # Only valid token-ids participate
+    if tid >= n_eff:
         return
 
+    # send row index in packed send payload
     dst_base  = tl.load(dst_offsets_ptr + dst).to(tl.int32)
     e_off     = tl.load(expert_offs_ptr + dst * e_local + expert).to(tl.int32)
-    send_base = dst_base + e_off
+    send_row  = dst_base + e_off + tid
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    m_mask = offs_m < n_eff
-
-    safe_row = tl.where(m_mask, send_base + offs_m, 0).to(tl.int32)
-    safe_m   = tl.where(m_mask, offs_m, 0).to(tl.int32)  # NEW: avoid OOB remote ptr even if masked
+    # remote base for this (expert, src_rank) slice on destination
     remote_base = (expert * world_size + src_rank) * CAP * hidden_dim
-    
+    remote_row  = tid  # place at row=tid inside [CAP, H]
 
+    # copy one token row, BLOCK_K across hidden dim
     for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
         k_mask = offs_k < hidden_dim
 
-        send_ptrs   = send_ptr + safe_row[:, None] * hidden_dim + offs_k[None, :]
-        remote_ptrs = token_buf_ptr + remote_base + safe_m[:, None] * hidden_dim + offs_k[None, :]
+        send_ptrs   = send_ptr + send_row * hidden_dim + offs_k
+        remote_ptrs = token_buf_ptr + remote_base + remote_row * hidden_dim + offs_k
 
         iris.put(
             send_ptrs,
@@ -141,32 +140,23 @@ def tokens_exchange_tiles_fused_kernel(
             from_rank=src_rank,
             to_rank=dst,
             heap_bases=heap_bases,
-            mask=m_mask[:, None] & k_mask[None, :],
+            mask=k_mask,
         )
 
-    # Count tiles for this (dst,expert,src) on destination
-    # tile_counter layout: [expert, src] contiguous
-    counter_ptr = tile_counter_ptr + expert * world_size + src_rank
-    old = iris.atomic_add(
-        counter_ptr,
-        1,
-        src_rank,
-        dst,
-        heap_bases,
-        sem="relaxed",
-        scope="sys",
-    )
+    # local completion accounting (ON SRC GPU)
+    # tile_counter_ptr used as LOCAL scratch: tile_counter[expert, dst] counts completed tokens
+    ctr_ptr = tile_counter_ptr + expert * world_size + dst
+    tl.atomic_add(ctr_ptr, 1, sem="relaxed")
 
-    # Only the last tile issues the per-src completion signal
-    if old == (expected_tiles - 1):
+    # ONE program spins until all tokens for this (dst, expert) done, then signals dst.token_sync[expert] += 1
+    if tid == 0:
+        # spin-wait until all token programs have incremented ctr_ptr
+        while tl.load(ctr_ptr, volatile=True) != n_eff:
+            pass
         iris.atomic_add(
-            token_sync_ptr + expert,
-            1,
-            src_rank,
-            dst,
-            heap_bases,
-            sem="release",
-            scope="sys",
+            token_sync_ptr + expert, 1,
+            src_rank, dst, heap_bases,
+            sem="release", scope="sys",
         )
     
 """

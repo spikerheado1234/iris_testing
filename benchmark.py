@@ -105,33 +105,35 @@ def _allreduce_min_i32(x: torch.Tensor) -> torch.Tensor:
     dist.all_reduce(y, op=dist.ReduceOp.MIN)
     return y
 
-def _wait_counts_ready(counts_ready: torch.Tensor, world_size: int, sleep_s: float = 0.0, timeout_s: float = 10.0) -> None:
+def _wait_counts_ready(counts_ready: torch.Tensor, world_size: int, sleep_s: float = 0.0) -> None:
+    """Barrier-free completion wait for Stage-1.
+
+    Waits until counts_ready[0] == world_size on the *local* rank.
+    NOTE: uses .item() polling (host-visible) and is intended for correctness / debug paths,
+    not for performance timing.
+    """
     assert counts_ready.numel() == 1
-    t0 = time.time()
     while True:
         if int(counts_ready.item()) >= int(world_size):
-             return
-        if (time.time() - t0) > timeout_s:
-            v = int(counts_ready.item())
-            r = dist.get_rank() if dist.is_initialized() else -1
-            raise RuntimeError(f"[rank{r}] wait_counts_ready TIMEOUT: {v} < {world_size}")
+            return
         if sleep_s:
             time.sleep(sleep_s)
 
-def _wait_token_sync(token_sync: torch.Tensor, world_size: int, sleep_s: float = 0.0, timeout_s: float = 10.0) -> None:
-    t0 = time.time()
+
+def _wait_token_sync(token_sync: torch.Tensor, world_size: int, sleep_s: float = 0.0) -> None:
+    """Barrier-free completion wait for Stage-2.
+
+    Waits until token_sync[e] == world_size for all local experts e on the *local* rank.
+    NOTE: uses .cpu() polling and is intended for correctness / debug paths,
+    not for performance timing.
+    """
+    # token_sync: [E_local]
     while True:
         vals = token_sync.detach().cpu()
         if bool((vals >= int(world_size)).all()):
             return
-        if (time.time() - t0) > timeout_s:
-            r = dist.get_rank() if dist.is_initialized() else -1
-            vmin = int(vals.min().item())
-            argmin = int(vals.argmin().item())
-            raise RuntimeError(f"[rank{r}] wait_token_sync TIMEOUT: min={vmin} < {world_size} at expert={argmin}, vals={vals.tolist()}")
         if sleep_s:
             time.sleep(sleep_s)
-
 
 
 # Profile pass (separate from perf timing) so the timing loop is good
@@ -166,14 +168,6 @@ def _profile_pass_custom(
 
     try:
         for i in range(PROFILE_ITERS):
-            # Keep profile deterministic: reset + order
-            buffers.pca.zero_()
-            buffers.counts_ready.zero_()
-            buffers.token_sync.zero_()
-            buffers.tile_counter.zero_()
-            if CLEAR_TOKEN_BUF:
-                buffers.token_buf.zero_()
-            shmem.barrier()
             # Keep the ops identical across ranks.
             if do_trace:
                 with torch.profiler.record_function(f"custom_prof_iter_{i}"):
@@ -190,9 +184,9 @@ def _profile_pass_custom(
                         num_experts_total,
                         capacity,
                     )
-                    #_wait_counts_ready(buffers.counts_ready, world_size, timeout_s=30.0)
-                    #_wait_token_sync(buffers.token_sync, world_size, timeout_s=30.0)
-                    shmem.barrier()
+                    _wait_counts_ready(buffers.counts_ready, world_size)
+                    _wait_token_sync(buffers.token_sync, world_size)
+                    
                 prof.step()
             else:
                 _ = custom_a2a(
@@ -208,9 +202,8 @@ def _profile_pass_custom(
                     num_experts_total,
                     capacity,
                 )
-                #_wait_counts_ready(buffers.counts_ready, world_size, timeout_s=30.0)
-                #_wait_token_sync(buffers.token_sync, world_size, timeout_s=30.0)
-                shmem.barrier()
+                _wait_counts_ready(buffers.counts_ready, world_size)
+                _wait_token_sync(buffers.token_sync, world_size)
     finally:
         if do_trace and prof is not None:
             prof.__exit__(None, None, None)
@@ -247,8 +240,6 @@ def _profile_pass_baseline(
 
     try:
         for i in range(PROFILE_ITERS):
-            # Keep profile deterministic: reset + order
-           
             if do_trace:
                 with torch.profiler.record_function(f"baseline_prof_iter_{i}"):
                     _ = run_baseline_ref(
@@ -265,7 +256,6 @@ def _profile_pass_baseline(
                         strict_capacity=False,
                         barrier=False,
                     )
-                    
                 prof.step()
             else:
                 _ = run_baseline_ref(
@@ -377,8 +367,6 @@ def check_compare(
         buffers.tile_counter.zero_() 
         if CLEAR_TOKEN_BUF:
             buffers.token_buf.zero_()
-        shmem.barrier()
-
 
         _ = custom_a2a(
             send_payload,
@@ -393,9 +381,8 @@ def check_compare(
             num_experts_total,
             capacity,
         )
-        #_wait_counts_ready(buffers.counts_ready, world_size, timeout_s=30.0)
-        #_wait_token_sync(buffers.token_sync, world_size, timeout_s=30.0)
-        shmem.barrier()
+        _wait_counts_ready(buffers.counts_ready, world_size)
+        _wait_token_sync(buffers.token_sync, world_size)
 
     #mark("A: before warmup dist.barrier")
     dist.barrier()
@@ -454,8 +441,6 @@ def check_compare(
         buffers.tile_counter.zero_()
         if CLEAR_TOKEN_BUF:
             buffers.token_buf.zero_()
-        shmem.barrier()
-
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -473,10 +458,9 @@ def check_compare(
             num_experts_total,
             capacity,
         )
-        #_wait_counts_ready(buffers.counts_ready, world_size, timeout_s=30.0)
-        #_wait_token_sync(buffers.token_sync, world_size, timeout_s=30.0)
-        shmem.barrier()
-
+        _wait_counts_ready(buffers.counts_ready, world_size)
+        _wait_token_sync(buffers.token_sync, world_size)
+        
         torch.cuda.synchronize()
         t1 = time.perf_counter()
         custom_times.append((t1 - t0) * 1e3)
@@ -585,9 +569,9 @@ def check_compare(
             base_buffers_perf,
         )
 
-    
+    # 
     # Correctness: run once, strict
-    
+    # 
     if CHECK:
         dist.barrier()
         torch.cuda.synchronize()
@@ -606,7 +590,6 @@ def check_compare(
         if CLEAR_TOKEN_BUF:
             buffers.token_buf.zero_()
 
-        shmem.barrier()
         _ = custom_a2a(
             send_payload,
             send_counts,
@@ -620,9 +603,8 @@ def check_compare(
             num_experts_total,
             capacity,
         )
-        #_wait_counts_ready(buffers.counts_ready, world_size, timeout_s=30.0)
-        #_wait_token_sync(buffers.token_sync, world_size, timeout_s=30.0)
-        shmem.barrier()
+        _wait_counts_ready(buffers.counts_ready, world_size)
+        _wait_token_sync(buffers.token_sync, world_size)
         torch.cuda.synchronize()
 
         # Baseline buffers for correctness (needs token_buf)
