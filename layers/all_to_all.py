@@ -100,9 +100,9 @@ class AllToAllOp(torch.autograd.Function):
        # Stage-2: token exchange (per-token blocks)
         BLOCK_K = 128
 
-        expert_offs = build_expert_offsets(dest_counts)  # 还是需要它
+        expert_offs = build_expert_offsets(dest_counts)   #still under utilization
         tile_counter.zero_()
-        # grid 第三维直接用 CAP（不用 dest_counts.max().item()，也不用 max_tiles）
+        
         tokens_exchange_kernel[(world_size, e_local, capacity)](
             tokens, dest_counts, dst_offsets, expert_offs,
             token_buf, token_sync, tile_counter, heap_bases,
