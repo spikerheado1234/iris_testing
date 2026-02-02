@@ -33,26 +33,24 @@ def counts_exchange_kernel(
     """Write counts to each dst's PCA[:, src_rank], then signal counts_ready++ on dst."""
 
     dst = tl.program_id(0)  # one program per destination rank
-    ## 取 Triton grid 的第 0 维 program id，作为 目的 rank（destination rank）意味着：本 kernel 的 launch 网格是 grid = (world_size,)，每个 program 专门负责一个 dst。
+    
     
 
     # Write the E counts for this destination.
     for e0 in tl.static_range(0, e_local, BLOCK_E):
         e = e0 + tl.arange(0, BLOCK_E)
         mask_e = e < e_local
-        ##构造当前块内的 expert 索引向量：tl.arange(0, BLOCK_E) 是 [0, 1, 2, ..., BLOCK_E-1]加上 e0 后变成 [e0, e0+1, ..., e0+BLOCK_E-1]
-        ##生成一个布尔 mask，标记当前块里哪些 e 是合法的（没有越界）。
+      
 
         # Local read: send_counts[dst, e]
         #vals = tl.load(send_counts_ptr + dst * e_local + e, mask=mask_e, other=0).to(tl.int32)
 
         # Remote write: pca[e, src_rank] on destination.
-        src_ptr = send_counts_ptr + dst * e_local + e  # new pointer 计算 src 端本地内存中 send_counts[dst, e] 的地址（向量地址）。
-        remote_ptr = pca_ptr + e * world_size + src_rank #r计算 dst 端对称内存 pca[e, src_rank] 的地址（也是向量地址）。
-                    #pca layout 是 [e_local, world_size]（你注释写 [E, world]）：
-                    #e * world_size：跳到第 e 行
-                    # src_rank：该行里第 src_rank 列
-        iris.put(  #写入对称堆，确保只写有用的元素
+        src_ptr = send_counts_ptr + dst * e_local + e  # new pointer 
+        remote_ptr = pca_ptr + e * world_size + src_rank 
+               
+             
+        iris.put( 
             src_ptr,            # from_ptr: pointer
             remote_ptr,         # to_ptr: pointer
             from_rank=src_rank,
@@ -61,10 +59,10 @@ def counts_exchange_kernel(
             heap_bases=heap_bases,
             mask=mask_e,        
         )
-        ##对本地 expert 维度 e_local 做分块循环，块大小 BLOCK_E。tl.static_range 表示 编译期展开（loop unrolling），生成多个固定次数的块。
+
 
     # Signal completion to destination (release semantics).
-    iris.atomic_add( #告诉dst完成
+    iris.atomic_add( 
         counts_ready_ptr,
         1,
         src_rank,
