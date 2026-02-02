@@ -6,6 +6,8 @@ import time
 import iris
 import torch.multiprocessing as mp
 from layers.all_to_all import custom_a2a
+# 4debug
+from layers.all_to_all import _LAST_DBG
 
 #from .layers.token_shuffle import shuffle
 #from .layers.expert import expert
@@ -21,18 +23,35 @@ def _spin_wait_counts(cb, world_size, timeout_s=10.0):
         if v >= world_size:
             return
         if time.time() - t0 > timeout_s:
-            raise RuntimeError(f"timeout waiting counts_ready: {v} < {world_size}")
-        time.sleep(0.001)  # avoid 100% CPU
+           # print what has not written
+            pca = cb.pca.detach().cpu().to(torch.int32)  # [E, world]
+            col_sums = pca.sum(dim=0).tolist()
+            raise RuntimeError(
+                f"timeout waiting counts_ready: {v} < {world_size}, "
+                f"pca_col_sums={col_sums}"
+            )
+        time.sleep(0.001)
 
-def _spin_wait_tokens(tb, world_size, timeout_s=10.0):
+def _spin_wait_tokens(tb, world_size, dbg=None, timeout_s=10.0):
     t0 = time.time()
     while True:
         ok = bool(torch.all(tb.token_sync == world_size).item())
         if ok:
             return
         if time.time() - t0 > timeout_s:
-            # print the vector to see which expert is stuck
-            raise RuntimeError(f"timeout waiting token_sync: {tb.token_sync.tolist()}")
+            msg = f"timeout token_sync: {tb.token_sync.tolist()}"
+            if dbg is not None:
+                stage, hb, last = dbg
+                msg += (
+                    f"\nstage=\n{stage.detach().cpu()}\n"
+                    f"hb=\n{hb.detach().cpu()}\n"
+                    f"last=\n{last.detach().cpu()}\n"
+                )
+            if _LAST_DBG:
+                print("stage:\n", _LAST_DBG["stage"].cpu())
+                print("hb:\n",    _LAST_DBG["hb"].cpu())
+                print("last:\n",  _LAST_DBG["last"].cpu())
+            raise RuntimeError(msg)
         time.sleep(0.001)
 
 
@@ -157,8 +176,8 @@ def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 3
     cb.counts_ready.zero_()
     tb.token_buf.zero_()
     tb.token_sync.zero_()
-    tb.tile_counter.zero_() 
-
+    #tb.tile_counter.zero_() 
+    tile_counter = torch.zeros((e_local, world_size), device="cuda", dtype=torch.int32)
     print(f"[rank{rank}] calling custom_a2a e_local={e_local}", flush=True)
     # the layerop
     out = custom_a2a(
@@ -169,7 +188,8 @@ def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 3
         tb.token_buf,
         cb.counts_ready,
         tb.token_sync,
-        tb.tile_counter,
+        #tb.tile_counter,
+        tile_counter,
         cb.heap_bases,
         experts,
         cap,

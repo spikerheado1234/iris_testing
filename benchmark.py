@@ -105,33 +105,61 @@ def _allreduce_min_i32(x: torch.Tensor) -> torch.Tensor:
     dist.all_reduce(y, op=dist.ReduceOp.MIN)
     return y
 
-def _wait_counts_ready(counts_ready: torch.Tensor, world_size: int, sleep_s: float = 0.0) -> None:
-    """Barrier-free completion wait for Stage-1.
+def _wait_counts_ready_vec(counts_ready_vec: torch.Tensor, world_size: int,
+                           timeout_s: float = 30.0, sleep_s: float = 0.01) -> None:
+    t0 = time.time()
+    mark(f"[wait_counts_ready_vec] ENTER target={world_size}")
+    last_hb = t0
 
-    Waits until counts_ready[0] == world_size on the *local* rank.
-    NOTE: uses .item() polling (host-visible) and is intended for correctness / debug paths,
-    not for performance timing.
-    """
-    assert counts_ready.numel() == 1
     while True:
-        if int(counts_ready.item()) >= int(world_size):
+        v = counts_ready_vec.detach().cpu().to(torch.int32)  # [W]
+        missing = (v == 0).nonzero(as_tuple=False).flatten().tolist()
+        if len(missing) == 0:
+            mark("[wait_counts_ready_vec] EXIT all arrived")
             return
+
+        now = time.time()
+        if now - last_hb >= 1.0:
+            mark(f"[wait_counts_ready_vec] STALL missing={missing} elapsed={now-t0:.1f}s")
+            last_hb = now
+
+        if now - t0 > timeout_s:
+            mark(f"[TIMEOUT wait_counts_ready_vec] missing={missing} elapsed={now-t0:.1f}s")
+            raise RuntimeError("TIMEOUT: counts_ready_vec not reached")
+
         if sleep_s:
             time.sleep(sleep_s)
 
 
-def _wait_token_sync(token_sync: torch.Tensor, world_size: int, sleep_s: float = 0.0) -> None:
-    """Barrier-free completion wait for Stage-2.
+def _wait_token_sync(token_sync: torch.Tensor, world_size: int,
+                     timeout_s: float = 30.0, sleep_s: float = 0.01) -> None:
+    t0 = time.time()
+    mark(f"[wait_token_sync] ENTER target={world_size}")
+    last_hb = t0
+    last_vals = None
 
-    Waits until token_sync[e] == world_size for all local experts e on the *local* rank.
-    NOTE: uses .cpu() polling and is intended for correctness / debug paths,
-    not for performance timing.
-    """
-    # token_sync: [E_local]
     while True:
-        vals = token_sync.detach().cpu()
-        if bool((vals >= int(world_size)).all()):
+        vals = token_sync.detach().cpu().to(torch.int32)
+        if bool((vals >= int(world_size)).all().item()):
+            mark(f"[wait_token_sync] EXIT token_sync={vals.tolist()}")
             return
+
+        now = time.time()
+        if last_vals is None or not torch.equal(vals, last_vals):
+            missing = (int(world_size) - vals).clamp(min=0)
+            mark(f"[wait_token_sync] progress token_sync={vals.tolist()} missing={missing.tolist()} t={now-t0:.2f}s")
+            last_vals = vals.clone()
+
+        if now - last_hb >= 1.0:
+            missing = (int(world_size) - vals).clamp(min=0)
+            mark(f"[wait_token_sync] STALL token_sync={vals.tolist()} missing={missing.tolist()} elapsed={now-t0:.1f}s")
+            last_hb = now
+
+        if now - t0 > timeout_s:
+            missing = (int(world_size) - vals).clamp(min=0)
+            mark(f"[TIMEOUT wait_token_sync] token_sync={vals.tolist()} missing={missing.tolist()} elapsed={now-t0:.1f}s")
+            raise RuntimeError("TIMEOUT: token_sync not reached")
+
         if sleep_s:
             time.sleep(sleep_s)
 
@@ -360,14 +388,14 @@ def check_compare(
        # Perf: COMM-only timing
  
     # Warmup custom (not timed)
-    for _ in range(WARMUP):
+    for i in range(WARMUP):
         buffers.pca.zero_()
         buffers.counts_ready.zero_()
         buffers.token_sync.zero_()
         buffers.tile_counter.zero_() 
         if CLEAR_TOKEN_BUF:
             buffers.token_buf.zero_()
-
+        mark("[ck] before custom_a2a")
         _ = custom_a2a(
             send_payload,
             send_counts,
@@ -381,8 +409,11 @@ def check_compare(
             num_experts_total,
             capacity,
         )
+        mark(f"[ck] after custom_a2a (before wait_counts_ready)")
         _wait_counts_ready(buffers.counts_ready, world_size)
+        mark(f"[ck] after wait_counts_ready (before wait_token_sync)")
         _wait_token_sync(buffers.token_sync, world_size)
+        mark(f"[ck] after wait_token_sync")
 
     #mark("A: before warmup dist.barrier")
     dist.barrier()
@@ -445,6 +476,7 @@ def check_compare(
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
+        mark("[ck] before custom_a2a")
         _ = custom_a2a(
             send_payload,
             send_counts,
@@ -458,8 +490,11 @@ def check_compare(
             num_experts_total,
             capacity,
         )
+        mark(f"[ck] after custom_a2a (before wait_counts_ready)")
         _wait_counts_ready(buffers.counts_ready, world_size)
+        mark(f"[ck] after wait_counts_ready (before wait_token_sync)")
         _wait_token_sync(buffers.token_sync, world_size)
+        mark(f"[ck] after wait_token_sync")
         
         torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -589,7 +624,8 @@ def check_compare(
         buffers.tile_counter.zero_() 
         if CLEAR_TOKEN_BUF:
             buffers.token_buf.zero_()
-
+       
+        mark("[ck] before custom_a2a")
         _ = custom_a2a(
             send_payload,
             send_counts,
@@ -603,8 +639,11 @@ def check_compare(
             num_experts_total,
             capacity,
         )
+        mark(f"[ck] after custom_a2a (before wait_counts_ready)")
         _wait_counts_ready(buffers.counts_ready, world_size)
+        mark(f"[ck] after wait_counts_ready (before wait_token_sync)")
         _wait_token_sync(buffers.token_sync, world_size)
+        mark(f"[ck] after wait_token_sync")
         torch.cuda.synchronize()
 
         # Baseline buffers for correctness (needs token_buf)

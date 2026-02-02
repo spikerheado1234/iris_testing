@@ -33,22 +33,26 @@ def counts_exchange_kernel(
     """Write counts to each dst's PCA[:, src_rank], then signal counts_ready++ on dst."""
 
     dst = tl.program_id(0)  # one program per destination rank
-
+    ## 取 Triton grid 的第 0 维 program id，作为 目的 rank（destination rank）意味着：本 kernel 的 launch 网格是 grid = (world_size,)，每个 program 专门负责一个 dst。
     
 
     # Write the E counts for this destination.
     for e0 in tl.static_range(0, e_local, BLOCK_E):
         e = e0 + tl.arange(0, BLOCK_E)
         mask_e = e < e_local
-       
+        ##构造当前块内的 expert 索引向量：tl.arange(0, BLOCK_E) 是 [0, 1, 2, ..., BLOCK_E-1]加上 e0 后变成 [e0, e0+1, ..., e0+BLOCK_E-1]
+        ##生成一个布尔 mask，标记当前块里哪些 e 是合法的（没有越界）。
 
         # Local read: send_counts[dst, e]
         #vals = tl.load(send_counts_ptr + dst * e_local + e, mask=mask_e, other=0).to(tl.int32)
 
         # Remote write: pca[e, src_rank] on destination.
-        src_ptr = send_counts_ptr + dst * e_local + e  
-        remote_ptr = pca_ptr + e * world_size + src_rank 
-        iris.put( 
+        src_ptr = send_counts_ptr + dst * e_local + e  # new pointer 计算 src 端本地内存中 send_counts[dst, e] 的地址（向量地址）。
+        remote_ptr = pca_ptr + e * world_size + src_rank #r计算 dst 端对称内存 pca[e, src_rank] 的地址（也是向量地址）。
+                    #pca layout 是 [e_local, world_size]（你注释写 [E, world]）：
+                    #e * world_size：跳到第 e 行
+                    # src_rank：该行里第 src_rank 列
+        iris.put(  #写入对称堆，确保只写有用的元素
             src_ptr,            # from_ptr: pointer
             remote_ptr,         # to_ptr: pointer
             from_rank=src_rank,
@@ -57,9 +61,10 @@ def counts_exchange_kernel(
             heap_bases=heap_bases,
             mask=mask_e,        
         )
+        ##对本地 expert 维度 e_local 做分块循环，块大小 BLOCK_E。tl.static_range 表示 编译期展开（loop unrolling），生成多个固定次数的块。
 
     # Signal completion to destination (release semantics).
-    iris.atomic_add( 
+    iris.atomic_add( #告诉dst完成
         counts_ready_ptr,
         1,
         src_rank,
@@ -80,6 +85,12 @@ def tokens_exchange_kernel(
     token_buf_ptr,       # [E, W, CAP, H] symmetric on dst
     token_sync_ptr,      # [E] int32 symmetric on dst
     tile_counter_ptr,    # [E, W] int32 LOCAL scratch on src (we repurpose it!)
+    # debug ptrs
+    dbg_stage_ptr,
+    dbg_hb_ptr,
+    dbg_last_ptr,
+    ##
+
     heap_bases,
     #*,
     src_rank: tl.constexpr,
@@ -94,10 +105,14 @@ def tokens_exchange_kernel(
     expert = tl.program_id(1)
     tid    = tl.program_id(2)  # token row id within this (dst, expert)
 
+     # dbg index = [expert, dst] flatten
+    dbg_idx = expert * world_size + dst
+
+
     # how many rows to send to (dst, expert)
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
     n_eff = tl.minimum(n, tl.full((), CAP, tl.int32))
-
+    
     # If no tokens: ONE program (tid==0) sends completion signal.
     if tid == 0:
         if n_eff == 0:
@@ -145,15 +160,38 @@ def tokens_exchange_kernel(
 
     # ONE program spins until all tokens for this (dst, expert) done, then signals dst.token_sync[expert] += 1
     if tid == 0:
+        # stage=1 : entering spin
+        tl.store(dbg_stage_ptr + dbg_idx, 1)
+        tl.store(dbg_hb_ptr + dbg_idx, 0)
+        tl.store(dbg_last_ptr + dbg_idx, -1)
+
+        # spin wait
+        v = tl.load(ctr_ptr, volatile=True)
+        while v != n_eff:
+            tl.store(dbg_last_ptr + dbg_idx, v)
+            tl.atomic_add(dbg_hb_ptr + dbg_idx, 1, sem="relaxed")
+            v = tl.load(ctr_ptr, volatile=True)
+        # v==n_eff when exit
+        tl.store(dbg_last_ptr + dbg_idx, v)
+            
+
+
         # spin-wait until all token programs have incremented ctr_ptr
-        while tl.load(ctr_ptr, volatile=True) != n_eff:
-            pass
+        #while tl.load(ctr_ptr, volatile=True) != n_eff:
+
+            #pass
+        
+        
+        # stage=2 : leaving spin, about to signal dst
+        tl.store(dbg_stage_ptr + dbg_idx, 2)
+
         iris.atomic_add(
             token_sync_ptr + expert, 1,
             src_rank, dst, heap_bases,
             sem="release", scope="sys",
         )
-    
+        # stage=99 : done
+        tl.store(dbg_stage_ptr + dbg_idx, 99)
 """
 @triton.jit
 def token_shuffle(

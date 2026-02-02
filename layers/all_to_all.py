@@ -7,6 +7,8 @@ import triton
 from kernels import counts_exchange_kernel, tokens_exchange_kernel
 from utils import build_expert_offsets, _assert_cuda_int32
 
+# 4debug
+_LAST_DBG = {}
 
 class AllToAllOp(torch.autograd.Function):
     
@@ -36,6 +38,7 @@ class AllToAllOp(torch.autograd.Function):
         token_sync,   # Stage-2 per-expert completion counters on *this* rank.
                       # Each remote src does atomic_add(+1, release) for each expert after writing token_buf.
         tile_counter, # new with the new kernel
+
         # Heap bases pointing to symmetric memory arrays of all devices participating in EP.
         # (Used by iris.put / iris.atomic_add to address peers' symmetric allocations.)
         heap_bases,   # [world] pointer-like tensor / address list (implementation-dependent)
@@ -96,24 +99,34 @@ class AllToAllOp(torch.autograd.Function):
             num_warps=4,
         )
         
-        
+        # 4 deubg
+
+        dbg_stage = torch.zeros((e_local, world_size), device=tokens.device, dtype=torch.int32)
+        dbg_hb    = torch.zeros((e_local, world_size), device=tokens.device, dtype=torch.int32)
+        dbg_last  = torch.full((e_local, world_size), -1, device=tokens.device, dtype=torch.int32)
+        global _LAST_DBG
+        _LAST_DBG["stage"] = dbg_stage
+        _LAST_DBG["hb"]    = dbg_hb
+        _LAST_DBG["last"]  = dbg_last
        # Stage-2: token exchange (per-token blocks)
         BLOCK_K = 128
 
-        expert_offs = build_expert_offsets(dest_counts)   #still under utilization
+        expert_offs = build_expert_offsets(dest_counts)  # 还是需要它
         tile_counter.zero_()
-        
+        # grid 第三维直接用 CAP（不用 dest_counts.max().item()，也不用 max_tiles）
         tokens_exchange_kernel[(world_size, e_local, capacity)](
-            tokens, dest_counts, dst_offsets, expert_offs,
-            token_buf, token_sync, tile_counter, heap_bases,
-            src_rank=rank,
-            world_size=world_size,
-            e_local=e_local,
-            CAP=capacity,
-            hidden_dim=hidden_dim,
-            BLOCK_K=BLOCK_K,
-            num_warps=4,   
-        )
+        tokens, dest_counts, dst_offsets, expert_offs,
+        token_buf, token_sync, tile_counter,
+        dbg_stage, dbg_hb, dbg_last,
+        heap_bases,
+        src_rank=rank,
+        world_size=world_size,
+        e_local=e_local,
+        CAP=capacity,
+        hidden_dim=hidden_dim,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+    )
         #return only the layer output (token_buf).
         return token_buf
 
