@@ -59,7 +59,7 @@ def counts_exchange_kernel(
         )
 
     # Signal completion to destination (release semantics).
-    iris.atomic_add( #告诉dst完成
+    iris.atomic_add( 
         counts_ready_ptr,
         1,
         src_rank,
