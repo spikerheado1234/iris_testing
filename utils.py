@@ -10,11 +10,73 @@ import torch.distributed as dist
 from dataclasses import dataclass
 
 
+def nvtx_push(msg):
+    torch.cuda.nvtx.range_push(msg)
+
+def nvtx_pop():
+    torch.cuda.nvtx.range_pop()
+
+# judging and checking cap
+def _allreduce_max_i32(x: torch.Tensor) -> torch.Tensor:
+    y = x.clone()
+    dist.all_reduce(y, op=dist.ReduceOp.MAX)
+    return y
+
+
+def _sync_and_check(ok_flag: torch.Tensor) -> int:
+    ok_global = _allreduce_min_i32(ok_flag).item()
+    if ok_global == 1:
+        dist.barrier()
+    return ok_global
+
+def _allreduce_min_i32(x: torch.Tensor) -> torch.Tensor:
+    y = x.clone()
+    dist.all_reduce(y, op=dist.ReduceOp.MIN)
+    return y
 
 def _assert_cuda_int32(x: torch.Tensor, name: str) -> None:
     
     assert x.is_cuda, f"{name} must be CUDA"
     assert x.dtype == torch.int32, f"{name} must be int32"
+
+
+
+def _build_dst_offsets(send_counts: torch.Tensor) -> torch.Tensor:
+    """dst_offsets[dst] = prefix sum of total tokens to earlier destinations."""
+    # send_counts: [world, E_local] int32
+    send_dst_sizes = send_counts.sum(dim=1).to(torch.int32)
+    dst_offsets = (torch.cumsum(send_dst_sizes, dim=0) - send_dst_sizes).to(torch.int32)
+    return dst_offsets.contiguous()
+
+
+def _masked_stats(
+    custom_buf: torch.Tensor,
+    base_buf: torch.Tensor,
+    counts_mat: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute max|diff| and sums over ONLY the valid (non-padding) region.
+
+    custom_buf/base_buf: [E, world, CAP, H]
+    counts_mat:           [E, world]  (counts_mat[e, src] = number of valid rows)
+
+    Returns: (max_diff, sum_custom, sum_base) as 0-dim float32 tensors on GPU.
+    """
+    assert custom_buf.shape == base_buf.shape
+    E, W, CAP, H = custom_buf.shape
+
+    # mask[e, src, m] = (m < counts_mat[e, src])
+    m = torch.arange(CAP, device=custom_buf.device, dtype=torch.int32)[None, None, :]
+    mask = (m < counts_mat.to(torch.int32)[:, :, None]).unsqueeze(-1)  # [E, W, CAP, 1]
+
+    diff = (custom_buf - base_buf).abs().to(torch.float32)
+    diff_masked = diff * mask.to(torch.float32)
+
+    max_diff = diff_masked.max()
+
+    sum_custom = (custom_buf.to(torch.float32) * mask.to(torch.float32)).sum()
+    sum_base = (base_buf.to(torch.float32) * mask.to(torch.float32)).sum()
+
+    return max_diff, sum_custom, sum_base
 
 # Step-1/2 run wrapper
 def build_expert_offsets(send_counts: torch.Tensor) -> torch.Tensor:

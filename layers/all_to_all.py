@@ -99,15 +99,7 @@ class AllToAllOp(torch.autograd.Function):
             num_warps=4,
         )
         
-        # 4 deubg
-
-        dbg_stage = torch.zeros((e_local, world_size), device=tokens.device, dtype=torch.int32)
-        dbg_hb    = torch.zeros((e_local, world_size), device=tokens.device, dtype=torch.int32)
-        dbg_last  = torch.full((e_local, world_size), -1, device=tokens.device, dtype=torch.int32)
-        global _LAST_DBG
-        _LAST_DBG["stage"] = dbg_stage
-        _LAST_DBG["hb"]    = dbg_hb
-        _LAST_DBG["last"]  = dbg_last
+     
        # Stage-2: token exchange (per-token blocks)
         BLOCK_K = 128
 
@@ -117,7 +109,6 @@ class AllToAllOp(torch.autograd.Function):
         tokens_exchange_kernel[(world_size, e_local, capacity)](
         tokens, dest_counts, dst_offsets, expert_offs,
         token_buf, token_sync, tile_counter,
-        dbg_stage, dbg_hb, dbg_last,
         heap_bases,
         src_rank=rank,
         world_size=world_size,

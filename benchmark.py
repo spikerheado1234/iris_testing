@@ -10,7 +10,7 @@ import iris
 import time
 from baseline import run_baseline_ref, init_baseline_buffers
 
-from utils import set_seed, gen_local_tokens, gen_router, route_and_pack_padding_free, alloc_shmem_buffers
+from utils import set_seed, gen_local_tokens, gen_router, route_and_pack_padding_free, alloc_shmem_buffers, nvtx_push, nvtx_pop, _allreduce_max_i32, _allreduce_min_i32, _sync_and_check, _build_dst_offsets, _masked_stats
 
 from  layers.all_to_all import custom_a2a
 
@@ -30,138 +30,10 @@ PROFILE_ITERS    = int(os.getenv("PROFILE_ITERS", "3"))
 TRACE_DIR        = os.getenv("TRACE_DIR", ".")
 
 
-def nvtx_push(msg):
-    torch.cuda.nvtx.range_push(msg)
-
-def nvtx_pop():
-    torch.cuda.nvtx.range_pop()
-
-
-def mark(msg: str):
-    # dist.get_rank() is safe only after init_process_group 
-    r = dist.get_rank() if dist.is_initialized() else -1
-    print(f"[{time.time():.3f}] rank{r}: {msg}", flush=True)
-
-
-def _sync_and_check(ok_flag: torch.Tensor) -> int:
-    ok_global = _allreduce_min_i32(ok_flag).item()
-    if ok_global == 1:
-        dist.barrier()
-    return ok_global
-
-
 def _init_iris_shmem():
-    #heap_gib = int(os.getenv("IRIS_HEAP_GIB", "100"))
-    #heap_size = heap_gib * (2**30)
     heap_size = IRIS_HEAP_GIB * (2**30)
     return iris.iris(heap_size)
 
-def _build_dst_offsets(send_counts: torch.Tensor) -> torch.Tensor:
-    """dst_offsets[dst] = prefix sum of total tokens to earlier destinations."""
-    # send_counts: [world, E_local] int32
-    send_dst_sizes = send_counts.sum(dim=1).to(torch.int32)
-    dst_offsets = (torch.cumsum(send_dst_sizes, dim=0) - send_dst_sizes).to(torch.int32)
-    return dst_offsets.contiguous()
-
-
-def _masked_stats(
-    custom_buf: torch.Tensor,
-    base_buf: torch.Tensor,
-    counts_mat: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute max|diff| and sums over ONLY the valid (non-padding) region.
-
-    custom_buf/base_buf: [E, world, CAP, H]
-    counts_mat:           [E, world]  (counts_mat[e, src] = number of valid rows)
-
-    Returns: (max_diff, sum_custom, sum_base) as 0-dim float32 tensors on GPU.
-    """
-    assert custom_buf.shape == base_buf.shape
-    E, W, CAP, H = custom_buf.shape
-
-    # mask[e, src, m] = (m < counts_mat[e, src])
-    m = torch.arange(CAP, device=custom_buf.device, dtype=torch.int32)[None, None, :]
-    mask = (m < counts_mat.to(torch.int32)[:, :, None]).unsqueeze(-1)  # [E, W, CAP, 1]
-
-    diff = (custom_buf - base_buf).abs().to(torch.float32)
-    diff_masked = diff * mask.to(torch.float32)
-
-    max_diff = diff_masked.max()
-
-    sum_custom = (custom_buf.to(torch.float32) * mask.to(torch.float32)).sum()
-    sum_base = (base_buf.to(torch.float32) * mask.to(torch.float32)).sum()
-
-    return max_diff, sum_custom, sum_base
-
-# judging and checking cap
-def _allreduce_max_i32(x: torch.Tensor) -> torch.Tensor:
-    y = x.clone()
-    dist.all_reduce(y, op=dist.ReduceOp.MAX)
-    return y
-
-
-def _allreduce_min_i32(x: torch.Tensor) -> torch.Tensor:
-    y = x.clone()
-    dist.all_reduce(y, op=dist.ReduceOp.MIN)
-    return y
-
-def _wait_counts_ready_vec(counts_ready_vec: torch.Tensor, world_size: int,
-                           timeout_s: float = 30.0, sleep_s: float = 0.01) -> None:
-    t0 = time.time()
-    mark(f"[wait_counts_ready_vec] ENTER target={world_size}")
-    last_hb = t0
-
-    while True:
-        v = counts_ready_vec.detach().cpu().to(torch.int32)  # [W]
-        missing = (v == 0).nonzero(as_tuple=False).flatten().tolist()
-        if len(missing) == 0:
-            mark("[wait_counts_ready_vec] EXIT all arrived")
-            return
-
-        now = time.time()
-        if now - last_hb >= 1.0:
-            mark(f"[wait_counts_ready_vec] STALL missing={missing} elapsed={now-t0:.1f}s")
-            last_hb = now
-
-        if now - t0 > timeout_s:
-            mark(f"[TIMEOUT wait_counts_ready_vec] missing={missing} elapsed={now-t0:.1f}s")
-            raise RuntimeError("TIMEOUT: counts_ready_vec not reached")
-
-        if sleep_s:
-            time.sleep(sleep_s)
-
-
-def _wait_token_sync(token_sync: torch.Tensor, world_size: int,
-                     timeout_s: float = 30.0, sleep_s: float = 0.01) -> None:
-    t0 = time.time()
-    mark(f"[wait_token_sync] ENTER target={world_size}")
-    last_hb = t0
-    last_vals = None
-
-    while True:
-        vals = token_sync.detach().cpu().to(torch.int32)
-        if bool((vals >= int(world_size)).all().item()):
-            mark(f"[wait_token_sync] EXIT token_sync={vals.tolist()}")
-            return
-
-        now = time.time()
-        if last_vals is None or not torch.equal(vals, last_vals):
-            missing = (int(world_size) - vals).clamp(min=0)
-            mark(f"[wait_token_sync] progress token_sync={vals.tolist()} missing={missing.tolist()} t={now-t0:.2f}s")
-            last_vals = vals.clone()
-
-        if now - last_hb >= 1.0:
-            missing = (int(world_size) - vals).clamp(min=0)
-            mark(f"[wait_token_sync] STALL token_sync={vals.tolist()} missing={missing.tolist()} elapsed={now-t0:.1f}s")
-            last_hb = now
-
-        if now - t0 > timeout_s:
-            missing = (int(world_size) - vals).clamp(min=0)
-            mark(f"[TIMEOUT wait_token_sync] token_sync={vals.tolist()} missing={missing.tolist()} elapsed={now-t0:.1f}s")
-            raise RuntimeError("TIMEOUT: token_sync not reached")
-
-        if sleep_s:
-            time.sleep(sleep_s)
 
 
 # Profile pass (separate from perf timing) so the timing loop is good
@@ -212,8 +84,7 @@ def _profile_pass_custom(
                         num_experts_total,
                         capacity,
                     )
-                    #_wait_counts_ready(buffers.counts_ready, world_size)
-                    #_wait_token_sync(buffers.token_sync, world_size)
+       
                     
                 prof.step()
             else:
@@ -230,8 +101,7 @@ def _profile_pass_custom(
                     num_experts_total,
                     capacity,
                 )
-                #_wait_counts_ready(buffers.counts_ready, world_size)
-                #_wait_token_sync(buffers.token_sync, world_size)
+              
     finally:
         if do_trace and prof is not None:
             prof.__exit__(None, None, None)
@@ -395,7 +265,7 @@ def check_compare(
         buffers.tile_counter.zero_() 
         if CLEAR_TOKEN_BUF:
             buffers.token_buf.zero_()
-        mark("[ck] before custom_a2a")
+        
         _ = custom_a2a(
             send_payload,
             send_counts,
@@ -410,16 +280,11 @@ def check_compare(
             capacity,
         )
         shmem.barrier()
-        print(f'proc: {dist.get_rank()} successfuly finished.')
-        #mark(f"[ck] after custom_a2a (before wait_counts_ready)")
-        #_wait_counts_ready(buffers.counts_ready, world_size)
-        #mark(f"[ck] after wait_counts_ready (before wait_token_sync)")
-        #_wait_token_sync(buffers.token_sync, world_size)
-        #mark(f"[ck] after wait_token_sync")
-        #dist.barrier()
-
-    #mark("A: before warmup dist.barrier")
-    #mark("A: after warmup dist.barrier")
+        
+      
+     
+    shmem.barrier()          # local alignment
+    dist.barrier()           # one-time global alignment (optional but safe)
     torch.cuda.synchronize()
 
 
@@ -427,9 +292,8 @@ def check_compare(
     ok = torch.tensor([1], device=device, dtype=torch.int32)
     warmup_err = None
     for i in range(WARMUP):
-    #for _ in range(WARMUP):
+
         try:
-            #mark(f"B: before baseline warmup iter={i} (NCCL collective inside)")
             _ = run_baseline_ref(
                 rank=rank,
                 world_size=world_size,
@@ -444,7 +308,8 @@ def check_compare(
                 strict_capacity=False,   # perf: don't throw
                 barrier=False,           # we sync outside consistently
             )
-            #mark(f"B: after baseline warmup iter={i}")
+           
+      
         except Exception as e:
             ok.zero_()
             warmup_err = repr(e)
@@ -460,9 +325,8 @@ def check_compare(
         return
 
     # Align start (do once not in per-iter)
-    #mark("B2: before post-baseline-warmup dist.barrier")
+   
     dist.barrier()
-    #mark("B2: after post-baseline-warmup dist.barrier")
     torch.cuda.synchronize()
 
     custom_times = []
@@ -478,7 +342,6 @@ def check_compare(
         torch.cuda.synchronize()
         t0 = time.perf_counter()
 
-        mark("[ck] before custom_a2a")
         _ = custom_a2a(
             send_payload,
             send_counts,
@@ -492,17 +355,12 @@ def check_compare(
             num_experts_total,
             capacity,
         )
-        #mark(f"[ck] after custom_a2a (before wait_counts_ready)")
-        #_wait_counts_ready(buffers.counts_ready, world_size)
-        #mark(f"[ck] after wait_counts_ready (before wait_token_sync)")
-        #_wait_token_sync(buffers.token_sync, world_size)
-        #mark(f"[ck] after wait_token_sync")
-        
+
         torch.cuda.synchronize()
         t1 = time.perf_counter()
         custom_times.append((t1 - t0) * 1e3)
 
-    
+        shmem.barrier()
 
     # Timed baseline — per-iter timing, sync semantics: safe barrier + cuda sync
    # Align start (do once not in the per-iter)
@@ -512,15 +370,12 @@ def check_compare(
     baseline_times = []
     timed_err = None
     ok.fill_(1)
-    
-    #for _ in range(ITERS):
-    #    if failed:
-    #        continue # continue while failed
+
     for i in range(ITERS):
         try:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            #mark(f"B: before baseline timed iter={i} (NCCL collective inside)")
+
             _ = run_baseline_ref(
                 rank=rank,
                 world_size=world_size,
@@ -533,19 +388,18 @@ def check_compare(
                 do_reorder=False,
                 profile=False,
                 strict_capacity=False,
-                barrier=False,   # in baseline no barrier
+                barrier=False,
             )
-            #mark(f"B: after baseline timed iter={i}")
+
             torch.cuda.synchronize()
             t1 = time.perf_counter()
             baseline_times.append((t1 - t0) * 1e3)
+
 
         except Exception as e:
             ok.zero_()
             timed_err = repr(e)
             break
-            
-
     # global ok check after loop
     ok_global = _allreduce_min_i32(ok).item()
     if ok_global == 0:
@@ -627,7 +481,7 @@ def check_compare(
         if CLEAR_TOKEN_BUF:
             buffers.token_buf.zero_()
        
-        mark("[ck] before custom_a2a")
+      
         _ = custom_a2a(
             send_payload,
             send_counts,
@@ -641,11 +495,7 @@ def check_compare(
             num_experts_total,
             capacity,
         )
-        #mark(f"[ck] after custom_a2a (before wait_counts_ready)")
-        #_wait_counts_ready(buffers.counts_ready, world_size)
-        #mark(f"[ck] after wait_counts_ready (before wait_token_sync)")
-        #_wait_token_sync(buffers.token_sync, world_size)
-        #mark(f"[ck] after wait_token_sync")
+      
         torch.cuda.synchronize()
 
         # Baseline buffers for correctness (needs token_buf)

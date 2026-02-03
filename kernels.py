@@ -83,11 +83,7 @@ def tokens_exchange_kernel(
     token_buf_ptr,       # [E, W, CAP, H] symmetric on dst
     token_sync_ptr,      # [E] int32 symmetric on dst
     tile_counter_ptr,    # [E, W] int32 LOCAL scratch on src (we repurpose it!)
-    # debug ptrs
-    dbg_stage_ptr,
-    dbg_hb_ptr,
-    dbg_last_ptr,
-    ##
+        ##
     heap_bases,
     #*,
     src_rank: tl.constexpr,
@@ -102,8 +98,7 @@ def tokens_exchange_kernel(
     expert = tl.program_id(1)
     tid    = tl.program_id(2)  # token row id within this (dst, expert)
 
-     # dbg index = [expert, dst] flatten
-    dbg_idx = expert * world_size + dst
+  
 
     # how many rows to send to (dst, expert)
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
@@ -169,8 +164,7 @@ def tokens_exchange_kernel(
             src_rank, dst, heap_bases,
             sem="release", scope="sys",
         )
-        # stage=99 : done
-        tl.store(dbg_stage_ptr + dbg_idx, 99)
+  
 """
 @triton.jit
 def token_shuffle(
