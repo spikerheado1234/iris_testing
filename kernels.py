@@ -88,7 +88,6 @@ def tokens_exchange_kernel(
     dbg_hb_ptr,
     dbg_last_ptr,
     ##
-
     heap_bases,
     #*,
     src_rank: tl.constexpr,
@@ -105,7 +104,6 @@ def tokens_exchange_kernel(
 
      # dbg index = [expert, dst] flatten
     dbg_idx = expert * world_size + dst
-
 
     # how many rows to send to (dst, expert)
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
@@ -154,34 +152,16 @@ def tokens_exchange_kernel(
     # local completion accounting (ON SRC GPU)
     # tile_counter_ptr used as LOCAL scratch: tile_counter[expert, dst] counts completed tokens
     ctr_ptr = tile_counter_ptr + expert * world_size + dst
-    tl.atomic_add(ctr_ptr, 1, sem="relaxed")
+    tl.atomic_add(ctr_ptr, 1, sem="release", scope="gpu")
 
     # ONE program spins until all tokens for this (dst, expert) done, then signals dst.token_sync[expert] += 1
     if tid == 0:
         # stage=1 : entering spin
-        tl.store(dbg_stage_ptr + dbg_idx, 1)
-        tl.store(dbg_hb_ptr + dbg_idx, 0)
-        tl.store(dbg_last_ptr + dbg_idx, -1)
-
         # spin wait
-        v = tl.load(ctr_ptr, volatile=True)
+        v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='release', scope='gpu')
         while v != n_eff:
-            tl.store(dbg_last_ptr + dbg_idx, v)
-            tl.atomic_add(dbg_hb_ptr + dbg_idx, 1, sem="relaxed")
-            v = tl.load(ctr_ptr, volatile=True)
+            v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='release', scope='gpu')
         # v==n_eff when exit
-        tl.store(dbg_last_ptr + dbg_idx, v)
-            
-
-
-        # spin-wait until all token programs have incremented ctr_ptr
-        #while tl.load(ctr_ptr, volatile=True) != n_eff:
-
-            #pass
-        
-        
-        # stage=2 : leaving spin, about to signal dst
-        tl.store(dbg_stage_ptr + dbg_idx, 2)
 
         iris.atomic_add(
             token_sync_ptr + expert, 1,
