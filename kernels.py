@@ -158,11 +158,11 @@ def tokens_exchange_kernel(
     if tid == 0:
         # stage=1 : entering spin
         # spin wait
-        v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acq_rel', scope='gpu')
-        ## For some reason, without it, spin-lock in 164 deadlocks. ##
+        v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='gpu')
+        ## For some reason, without it, spin-lock in 163 deadlocks. ##
         tl.debug_barrier()            
         while v != n_eff:
-            v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acq_rel', scope='gpu')
+            v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='gpu')
 
         iris.atomic_add(
             token_sync_ptr + expert, 1,
