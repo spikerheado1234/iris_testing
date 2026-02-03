@@ -212,8 +212,8 @@ def _profile_pass_custom(
                         num_experts_total,
                         capacity,
                     )
-                    _wait_counts_ready(buffers.counts_ready, world_size)
-                    _wait_token_sync(buffers.token_sync, world_size)
+                    #_wait_counts_ready(buffers.counts_ready, world_size)
+                    #_wait_token_sync(buffers.token_sync, world_size)
                     
                 prof.step()
             else:
@@ -230,8 +230,8 @@ def _profile_pass_custom(
                     num_experts_total,
                     capacity,
                 )
-                _wait_counts_ready(buffers.counts_ready, world_size)
-                _wait_token_sync(buffers.token_sync, world_size)
+                #_wait_counts_ready(buffers.counts_ready, world_size)
+                #_wait_token_sync(buffers.token_sync, world_size)
     finally:
         if do_trace and prof is not None:
             prof.__exit__(None, None, None)
@@ -409,14 +409,16 @@ def check_compare(
             num_experts_total,
             capacity,
         )
-        mark(f"[ck] after custom_a2a (before wait_counts_ready)")
-        _wait_counts_ready(buffers.counts_ready, world_size)
-        mark(f"[ck] after wait_counts_ready (before wait_token_sync)")
-        _wait_token_sync(buffers.token_sync, world_size)
-        mark(f"[ck] after wait_token_sync")
+        shmem.barrier()
+        print(f'proc: {dist.get_rank()} successfuly finished.')
+        #mark(f"[ck] after custom_a2a (before wait_counts_ready)")
+        #_wait_counts_ready(buffers.counts_ready, world_size)
+        #mark(f"[ck] after wait_counts_ready (before wait_token_sync)")
+        #_wait_token_sync(buffers.token_sync, world_size)
+        #mark(f"[ck] after wait_token_sync")
+        #dist.barrier()
 
     #mark("A: before warmup dist.barrier")
-    dist.barrier()
     #mark("A: after warmup dist.barrier")
     torch.cuda.synchronize()
 
@@ -490,11 +492,11 @@ def check_compare(
             num_experts_total,
             capacity,
         )
-        mark(f"[ck] after custom_a2a (before wait_counts_ready)")
-        _wait_counts_ready(buffers.counts_ready, world_size)
-        mark(f"[ck] after wait_counts_ready (before wait_token_sync)")
-        _wait_token_sync(buffers.token_sync, world_size)
-        mark(f"[ck] after wait_token_sync")
+        #mark(f"[ck] after custom_a2a (before wait_counts_ready)")
+        #_wait_counts_ready(buffers.counts_ready, world_size)
+        #mark(f"[ck] after wait_counts_ready (before wait_token_sync)")
+        #_wait_token_sync(buffers.token_sync, world_size)
+        #mark(f"[ck] after wait_token_sync")
         
         torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -639,11 +641,11 @@ def check_compare(
             num_experts_total,
             capacity,
         )
-        mark(f"[ck] after custom_a2a (before wait_counts_ready)")
-        _wait_counts_ready(buffers.counts_ready, world_size)
-        mark(f"[ck] after wait_counts_ready (before wait_token_sync)")
-        _wait_token_sync(buffers.token_sync, world_size)
-        mark(f"[ck] after wait_token_sync")
+        #mark(f"[ck] after custom_a2a (before wait_counts_ready)")
+        #_wait_counts_ready(buffers.counts_ready, world_size)
+        #mark(f"[ck] after wait_counts_ready (before wait_token_sync)")
+        #_wait_token_sync(buffers.token_sync, world_size)
+        #mark(f"[ck] after wait_token_sync")
         torch.cuda.synchronize()
 
         # Baseline buffers for correctness (needs token_buf)
