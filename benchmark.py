@@ -29,6 +29,11 @@ PROFILE_BASELINE = int(os.getenv("PROFILE_BASELINE", "0")) == 1
 PROFILE_ITERS    = int(os.getenv("PROFILE_ITERS", "3"))
 TRACE_DIR        = os.getenv("TRACE_DIR", ".")
 
+BLOCK_E = int(os.getenv("BLOCK_E", "128"))
+COUNTS_WARPS = int(os.getenv("COUNTS_WARPS", "4"))
+BLOCK_K = int(os.getenv("BLOCK_K", "128"))
+TOKENS_WARPS = int(os.getenv("TOKENS_WARPS", "4"))
+
 
 def _init_iris_shmem():
     heap_size = IRIS_HEAP_GIB * (2**30)
@@ -71,6 +76,7 @@ def _profile_pass_custom(
             # Keep the ops identical across ranks.
             if do_trace:
                 with torch.profiler.record_function(f"custom_prof_iter_{i}"):
+                    torch.cuda.synchronize()
                     _ = custom_a2a(
                         send_payload,
                         send_counts,
@@ -83,11 +89,14 @@ def _profile_pass_custom(
                         buffers.heap_bases,
                         num_experts_total,
                         capacity,
+                        BLOCK_E, COUNTS_WARPS, BLOCK_K, TOKENS_WARPS,
                     )
-       
+                    torch.cuda.synchronize()
+                    shmem.barrier()
                     
                 prof.step()
             else:
+                torch.cuda.synchronize()
                 _ = custom_a2a(
                     send_payload,
                     send_counts,
@@ -100,7 +109,10 @@ def _profile_pass_custom(
                     buffers.heap_bases,
                     num_experts_total,
                     capacity,
+                    BLOCK_E, COUNTS_WARPS, BLOCK_K, TOKENS_WARPS,
                 )
+                torch.cuda.synchronize()
+                shmem.barrier()
               
     finally:
         if do_trace and prof is not None:
@@ -111,6 +123,7 @@ def _profile_pass_custom(
 
 def _profile_pass_baseline(
     rank: int,
+    shmem,
     world_size: int,
     e_local: int,
     capacity: int,
@@ -140,6 +153,7 @@ def _profile_pass_baseline(
         for i in range(PROFILE_ITERS):
             if do_trace:
                 with torch.profiler.record_function(f"baseline_prof_iter_{i}"):
+                    torch.cuda.synchronize()
                     _ = run_baseline_ref(
                         rank=rank,
                         world_size=world_size,
@@ -154,8 +168,11 @@ def _profile_pass_baseline(
                         strict_capacity=False,
                         barrier=False,
                     )
+                    torch.cuda.synchronize()
+                    shmem.barrier()
                 prof.step()
             else:
+                torch.cuda.synchronize()
                 _ = run_baseline_ref(
                     rank=rank,
                     world_size=world_size,
@@ -170,6 +187,8 @@ def _profile_pass_baseline(
                     strict_capacity=False,
                     barrier=False,
                 )
+                torch.cuda.synchronize()
+                shmem.barrier()
     finally:
         if do_trace and prof is not None:
             prof.__exit__(None, None, None)
@@ -237,7 +256,8 @@ def check_compare(
         hidden_dim=hidden_dim,
         token_dtype=torch.bfloat16,
     )
-
+    # fix the extra cost
+    buffers.heap_bases = buffers.heap_bases.to(device, non_blocking=True)
     # Optional clarity
     if CLEAR_TOKEN_BUF:
         buffers.token_buf.zero_()
@@ -254,6 +274,7 @@ def check_compare(
         total_recv=total_recv,
         allocate_token_buf=False,   # perf: do not allocate token_buf / reorder target
     )
+    
 
        # Perf: COMM-only timing
  
@@ -278,6 +299,7 @@ def check_compare(
             buffers.heap_bases,
             num_experts_total,
             capacity,
+            BLOCK_E, COUNTS_WARPS, BLOCK_K, TOKENS_WARPS,
         )
         shmem.barrier()
         
@@ -354,6 +376,7 @@ def check_compare(
             buffers.heap_bases,
             num_experts_total,
             capacity,
+            BLOCK_E, COUNTS_WARPS, BLOCK_K, TOKENS_WARPS,
         )
 
         torch.cuda.synchronize()
@@ -375,7 +398,8 @@ def check_compare(
         try:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-
+            # fair compare
+            
             _ = run_baseline_ref(
                 rank=rank,
                 world_size=world_size,
@@ -393,8 +417,9 @@ def check_compare(
 
             torch.cuda.synchronize()
             t1 = time.perf_counter()
+            
             baseline_times.append((t1 - t0) * 1e3)
-
+            shmem.barrier()
 
         except Exception as e:
             ok.zero_()
@@ -451,6 +476,7 @@ def check_compare(
     if PROFILE_BASELINE:
         _profile_pass_baseline(
             rank,
+            shmem,
             world_size,
             e_local,
             capacity,
@@ -494,6 +520,7 @@ def check_compare(
             buffers.heap_bases,
             num_experts_total,
             capacity,
+            BLOCK_E, COUNTS_WARPS, BLOCK_K, TOKENS_WARPS,
         )
       
         torch.cuda.synchronize()
@@ -567,8 +594,11 @@ if __name__ == "__main__":
     capacity   = int(os.getenv("CAPACITY", "8096"))
     seed       = int(os.getenv("SEED", "42")) # random ssed
 
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29500")
+    # Robust defaults for env:// rendezvous
+    if not os.environ.get("MASTER_ADDR"):
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+    if not os.environ.get("MASTER_PORT"):
+        os.environ["MASTER_PORT"] = "29500"
 
     mp.spawn(
         check_compare,

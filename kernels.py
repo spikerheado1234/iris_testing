@@ -147,17 +147,17 @@ def tokens_exchange_kernel(
     # local completion accounting (ON SRC GPU)
     # tile_counter_ptr used as LOCAL scratch: tile_counter[expert, dst] counts completed tokens
     ctr_ptr = tile_counter_ptr + expert * world_size + dst
-    tl.atomic_add(ctr_ptr, 1, sem="release", scope="gpu")
+    tl.atomic_add(ctr_ptr, 1, sem="release", scope="sys")
 
     # ONE program spins until all tokens for this (dst, expert) done, then signals dst.token_sync[expert] += 1
     if tid == 0:
         # stage=1 : entering spin
         # spin wait
-        v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='gpu')
+        v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='sys')
         ## For some reason, without it, spin-lock in 163 deadlocks. ##
         tl.debug_barrier()            
         while v != n_eff:
-            v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='gpu')
+            v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='sys')
 
         iris.atomic_add(
             token_sync_ptr + expert, 1,

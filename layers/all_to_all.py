@@ -7,8 +7,11 @@ import triton
 from kernels import counts_exchange_kernel, tokens_exchange_kernel
 from utils import build_expert_offsets, _assert_cuda_int32
 
+
 # 4debug
 _LAST_DBG = {}
+
+
 
 class AllToAllOp(torch.autograd.Function):
     
@@ -47,6 +50,12 @@ class AllToAllOp(torch.autograd.Function):
         
         experts,       # total number of experts in the EP group (global)
         capacity,      # CAP: max rows per (dst, expert) stored in token_buf; must match token_buf.shape[2]
+
+        # 4 tunes
+        block_e: int = 128,
+        counts_num_warps: int = 4,
+        block_k: int = 128,
+        token_num_warps: int = 4,
     ):
         """
     Custom Shmem-based AllToAll for Expert parallelism.
@@ -86,6 +95,10 @@ class AllToAllOp(torch.autograd.Function):
         e_local = experts // world_size
         hidden_dim = tokens.shape[-1]
 
+        # moved stage2 side cpu part here so theres no more gap
+        tile_counter.zero_()
+        expert_offs = build_expert_offsets(dest_counts)
+
         # Stage-1: counts exchange
         counts_exchange_kernel[(world_size,)](
             dest_counts,     # send_counts_ptr
@@ -95,17 +108,13 @@ class AllToAllOp(torch.autograd.Function):
             src_rank=rank,
             world_size=world_size,
             e_local=e_local,
-            BLOCK_E=128,
-            num_warps=4,
+            BLOCK_E=block_e,
+            num_warps=counts_num_warps,
         )
         
      
        # Stage-2: token exchange (per-token blocks)
-        BLOCK_K = 128
-
-        expert_offs = build_expert_offsets(dest_counts)  
-        tile_counter.zero_()
-
+          
         tokens_exchange_kernel[(world_size, e_local, capacity)](
         tokens, dest_counts, dst_offsets, expert_offs,
         token_buf, token_sync, tile_counter,
@@ -115,8 +124,8 @@ class AllToAllOp(torch.autograd.Function):
         e_local=e_local,
         CAP=capacity,
         hidden_dim=hidden_dim,
-        BLOCK_K=BLOCK_K,
-        num_warps=4,
+        BLOCK_K=block_k,
+        num_warps=token_num_warps,
     )
         #return only the layer output (token_buf).
         return token_buf
