@@ -53,11 +53,10 @@ def _profile_pass_custom(
     num_experts_total: int,
     capacity: int,
 ):
-    world_size = dist.get_world_size()
-    # All ranks run the same ops; only rank0 records trace.
-    do_trace = (rank == 0) and PROFILE_CUSTOM
+    do_trace = (rank == 0)
     trace_path = os.path.join(TRACE_DIR, f"trace_custom_rank{rank}.json")
 
+    prof = None
     if do_trace:
         os.makedirs(TRACE_DIR, exist_ok=True)
         prof = torch.profiler.profile(
@@ -67,56 +66,41 @@ def _profile_pass_custom(
             profile_memory=False,
             with_stack=False,
         )
-        prof.__enter__()
-    else:
-        prof = None
+        prof.start()
 
     try:
         for i in range(PROFILE_ITERS):
-            # Keep the ops identical across ranks.
             if do_trace:
-                with torch.profiler.record_function(f"custom_prof_iter_{i}"):
-                    torch.cuda.synchronize()
-                    _ = custom_a2a(
-                        send_payload,
-                        send_counts,
-                        dst_offsets,
-                        buffers.pca,
-                        buffers.token_buf,
-                        buffers.counts_ready,
-                        buffers.token_sync,
-                        buffers.tile_counter,
-                        buffers.heap_bases,
-                        num_experts_total,
-                        capacity,
-                        BLOCK_E, COUNTS_WARPS, BLOCK_K, TOKENS_WARPS,
-                    )
-                    torch.cuda.synchronize()
-                    shmem.barrier()
-                    
+                ctx = torch.profiler.record_function(f"custom_prof_iter_{i}")
+                ctx.__enter__()
+            
+
+            torch.cuda.synchronize()
+            _ = custom_a2a(
+                send_payload,
+                send_counts,
+                dst_offsets,
+                buffers.pca,
+                buffers.token_buf,
+                buffers.counts_ready,
+                buffers.token_sync,
+                buffers.tile_counter,
+                buffers.heap_bases,
+                num_experts_total,
+                capacity,
+                BLOCK_E, COUNTS_WARPS, BLOCK_K, TOKENS_WARPS,
+            )
+            torch.cuda.synchronize()
+            shmem.barrier()
+ 
+
+            if do_trace:
+                ctx.__exit__(None, None, None)
                 prof.step()
-            else:
-                torch.cuda.synchronize()
-                _ = custom_a2a(
-                    send_payload,
-                    send_counts,
-                    dst_offsets,
-                    buffers.pca,
-                    buffers.token_buf,
-                    buffers.counts_ready,
-                    buffers.token_sync,
-                    buffers.tile_counter,
-                    buffers.heap_bases,
-                    num_experts_total,
-                    capacity,
-                    BLOCK_E, COUNTS_WARPS, BLOCK_K, TOKENS_WARPS,
-                )
-                torch.cuda.synchronize()
-                shmem.barrier()
-              
+
     finally:
         if do_trace and prof is not None:
-            prof.__exit__(None, None, None)
+            prof.stop()
             prof.export_chrome_trace(trace_path)
             print(f"[trace] wrote {trace_path}", flush=True)
 
@@ -132,10 +116,10 @@ def _profile_pass_baseline(
     send_counts,
     base_buffers_perf,
 ):
-    # IMPORTANT: baseline has collectives inside -> ALL ranks must execute.
-    do_trace = (rank == 0) and PROFILE_BASELINE
+    do_trace = (rank == 0)
     trace_path = os.path.join(TRACE_DIR, f"trace_baseline_rank{rank}.json")
 
+    prof = None
     if do_trace:
         os.makedirs(TRACE_DIR, exist_ok=True)
         prof = torch.profiler.profile(
@@ -145,53 +129,39 @@ def _profile_pass_baseline(
             profile_memory=False,
             with_stack=False,
         )
-        prof.__enter__()
-    else:
-        prof = None
+        prof.start()
 
     try:
         for i in range(PROFILE_ITERS):
             if do_trace:
-                with torch.profiler.record_function(f"baseline_prof_iter_{i}"):
-                    torch.cuda.synchronize()
-                    _ = run_baseline_ref(
-                        rank=rank,
-                        world_size=world_size,
-                        e_local=e_local,
-                        capacity=capacity,
-                        hidden_dim=hidden_dim,
-                        send_payload=send_payload,
-                        send_counts=send_counts,
-                        buffers=base_buffers_perf,
-                        do_reorder=False,       # COMM-only
-                        profile=False,
-                        strict_capacity=False,
-                        barrier=False,
-                    )
-                    torch.cuda.synchronize()
-                    shmem.barrier()
+                ctx = torch.profiler.record_function(f"baseline_prof_iter_{i}")
+                ctx.__enter__()
+
+            torch.cuda.synchronize()
+            _ = run_baseline_ref(
+                rank=rank,
+                world_size=world_size,
+                e_local=e_local,
+                capacity=capacity,
+                hidden_dim=hidden_dim,
+                send_payload=send_payload,
+                send_counts=send_counts,
+                buffers=base_buffers_perf,
+                do_reorder=False,       # COMM-only
+                profile=False,
+                strict_capacity=False,
+                barrier=False,
+            )
+            torch.cuda.synchronize()
+            shmem.barrier()
+
+            if do_trace:
+                ctx.__exit__(None, None, None)
                 prof.step()
-            else:
-                torch.cuda.synchronize()
-                _ = run_baseline_ref(
-                    rank=rank,
-                    world_size=world_size,
-                    e_local=e_local,
-                    capacity=capacity,
-                    hidden_dim=hidden_dim,
-                    send_payload=send_payload,
-                    send_counts=send_counts,
-                    buffers=base_buffers_perf,
-                    do_reorder=False,       # COMM-only
-                    profile=False,
-                    strict_capacity=False,
-                    barrier=False,
-                )
-                torch.cuda.synchronize()
-                shmem.barrier()
+
     finally:
         if do_trace and prof is not None:
-            prof.__exit__(None, None, None)
+            prof.stop()
             prof.export_chrome_trace(trace_path)
             print(f"[trace] wrote {trace_path}", flush=True)
 
@@ -351,6 +321,9 @@ def check_compare(
     dist.barrier()
     torch.cuda.synchronize()
 
+    # cuda evenets
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
     custom_times = []
 
     for i in range(ITERS):
@@ -362,7 +335,8 @@ def check_compare(
             buffers.token_buf.zero_()
 
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
+
+        start_event.record()
 
         _ = custom_a2a(
             send_payload,
@@ -379,9 +353,9 @@ def check_compare(
             BLOCK_E, COUNTS_WARPS, BLOCK_K, TOKENS_WARPS,
         )
 
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        custom_times.append((t1 - t0) * 1e3)
+        end_event.record()
+        end_event.synchronize()
+        custom_times.append(start_event.elapsed_time(end_event))
 
         shmem.barrier()
 
@@ -397,7 +371,7 @@ def check_compare(
     for i in range(ITERS):
         try:
             torch.cuda.synchronize()
-            t0 = time.perf_counter()
+            start_event.record()
             # fair compare
             
             _ = run_baseline_ref(
@@ -415,10 +389,10 @@ def check_compare(
                 barrier=False,
             )
 
-            torch.cuda.synchronize()
-            t1 = time.perf_counter()
+            end_event.record()
+            end_event.synchronize()
             
-            baseline_times.append((t1 - t0) * 1e3)
+            baseline_times.append(start_event.elapsed_time(end_event))
             shmem.barrier()
 
         except Exception as e:

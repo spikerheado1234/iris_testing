@@ -124,7 +124,8 @@ def tokens_exchange_kernel(
     send_row  = dst_base + e_off + tid
 
     # remote base for this (expert, src_rank) slice on destination
-    remote_base = (expert * world_size + src_rank) * CAP * hidden_dim
+    # [FIX] Cast to int64 to avoid overflow when CAP*H is large (>2GB)
+    remote_base = (expert.to(tl.int64) * world_size + src_rank) * CAP * hidden_dim
     remote_row  = tid  # place at row=tid inside [CAP, H]
 
     # copy one token row, BLOCK_K across hidden dim
