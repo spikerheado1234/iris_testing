@@ -97,11 +97,15 @@ def exchange_counts_a2a(
     # Flatten as [dst-major, e-major] for a2a.
     send_flat = send_counts.contiguous().view(-1)  # [world_size * e_local]
 
-    # Each rank sends exactly e_local ints to each dst.
-    in_splits = torch.full((world_size,), e_local, device=send_counts.device, dtype=torch.int32)
-    out_splits = torch.full((world_size,), e_local, device=send_counts.device, dtype=torch.int32)
-
-    dist.all_to_all_single(buffers.recv_counts_flat, send_flat, output_split_sizes=out_splits, input_split_sizes=in_splits)
+    # Each rank sends exactly e_local int32s to each peer for counts exchange.
+    in_splits_list  = [int(e_local)] * int(world_size)
+    out_splits_list = [int(e_local)] * int(world_size)
+    dist.all_to_all_single(
+        buffers.recv_counts_flat,
+        send_flat,
+        output_split_sizes=out_splits_list,
+        input_split_sizes=in_splits_list,
+    )
 
     buffers.recv_counts.copy_(buffers.recv_counts_flat.view(world_size, e_local))
 
@@ -155,12 +159,15 @@ def exchange_payload_a2a(
         buffers.recv_payload_flat = torch.empty((total_recv, send_payload.shape[1]),
                                                device=send_payload.device,
                                                dtype=send_payload.dtype)
+    in_splits_list  = in_splits.to("cpu", non_blocking=False).to(torch.int64).tolist()
+    out_splits_list = out_splits.to("cpu", non_blocking=False).to(torch.int64).tolist()
+
 
     dist.all_to_all_single(
         buffers.recv_payload_flat,
         send_payload,
-        output_split_sizes=out_splits,
-        input_split_sizes=in_splits,
+        output_split_sizes=out_splits_list,
+        input_split_sizes=in_splits_list,
     )
 
     return buffers.recv_payload_flat, in_splits, out_splits

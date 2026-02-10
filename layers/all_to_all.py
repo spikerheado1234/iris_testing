@@ -1,11 +1,17 @@
 import torch
 import torch.distributed as dist
-
+import triton
 # from .kernels import counts_exchange_kernel, tokens_exchange_kernel, build_expert_offsets
 
 
-from .kernels import counts_exchange_kernel, tokens_exchange_kernel
-from .utils import build_expert_offsets, _assert_cuda_int32
+from kernels import counts_exchange_kernel, tokens_exchange_kernel
+from utils import build_expert_offsets, _assert_cuda_int32
+
+
+# 4debug
+_LAST_DBG = {}
+
+
 
 class AllToAllOp(torch.autograd.Function):
     
@@ -34,6 +40,7 @@ class AllToAllOp(torch.autograd.Function):
                       # Each remote src does atomic_add(+1, release) after writing its column of local_pca.
         token_sync,   # Stage-2 per-expert completion counters on *this* rank.
                       # Each remote src does atomic_add(+1, release) for each expert after writing token_buf.
+        tile_counter, # new with the new kernel
 
         # Heap bases pointing to symmetric memory arrays of all devices participating in EP.
         # (Used by iris.put / iris.atomic_add to address peers' symmetric allocations.)
@@ -43,6 +50,12 @@ class AllToAllOp(torch.autograd.Function):
         
         experts,       # total number of experts in the EP group (global)
         capacity,      # CAP: max rows per (dst, expert) stored in token_buf; must match token_buf.shape[2]
+
+        # 4 tunes
+        block_e: int = 128,
+        counts_num_warps: int = 4,
+        block_k: int = 128,
+        token_num_warps: int = 4,
     ):
         """
     Custom Shmem-based AllToAll for Expert parallelism.
@@ -77,10 +90,14 @@ class AllToAllOp(torch.autograd.Function):
         world_size = dist.get_world_size()
         rank = dist.get_rank()
 
-        assert experts % world_size, 'EP-group size unevenly calculated.'
+        assert experts % world_size == 0, 'EP-group size unevenly calculated.'
 
         e_local = experts // world_size
         hidden_dim = tokens.shape[-1]
+
+        # moved stage2 side cpu part here so theres no more gap
+        tile_counter.zero_()
+        expert_offs = build_expert_offsets(dest_counts)
 
         # Stage-1: counts exchange
         counts_exchange_kernel[(world_size,)](
@@ -91,30 +108,25 @@ class AllToAllOp(torch.autograd.Function):
             src_rank=rank,
             world_size=world_size,
             e_local=e_local,
-            BLOCK_E=128,
-            num_warps=4,
+            BLOCK_E=block_e,
+            num_warps=counts_num_warps,
         )
-
-        # Stage-2: token exchange
-        expert_offs = build_expert_offsets(dest_counts)  # prefix offsets per (dst, expert) :contentReference[oaicite:11]{index=11}
-        tokens_exchange_kernel[(world_size, e_local)](
-            tokens,
-            dest_counts,
-            dst_offsets,
-            expert_offs,
-            token_buf,
-            token_sync,
-            heap_bases,
-            src_rank=rank,
-            world_size=world_size,
-            e_local=e_local,
-            CAP=capacity,
-            hidden_dim=hidden_dim,
-            BLOCK_M=32,
-            BLOCK_K=128,
-            num_warps=8,
-        )
-
+        
+     
+       # Stage-2: token exchange (per-token blocks)
+          
+        tokens_exchange_kernel[(world_size, e_local, capacity)](
+        tokens, dest_counts, dst_offsets, expert_offs,
+        token_buf, token_sync, tile_counter,
+        heap_bases,
+        src_rank=rank,
+        world_size=world_size,
+        e_local=e_local,
+        CAP=capacity,
+        hidden_dim=hidden_dim,
+        BLOCK_K=block_k,
+        num_warps=token_num_warps,
+    )
         #return only the layer output (token_buf).
         return token_buf
 

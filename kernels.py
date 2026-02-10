@@ -33,29 +33,36 @@ def counts_exchange_kernel(
     """Write counts to each dst's PCA[:, src_rank], then signal counts_ready++ on dst."""
 
     dst = tl.program_id(0)  # one program per destination rank
+    
+    
 
     # Write the E counts for this destination.
     for e0 in tl.static_range(0, e_local, BLOCK_E):
         e = e0 + tl.arange(0, BLOCK_E)
         mask_e = e < e_local
+      
 
         # Local read: send_counts[dst, e]
         #vals = tl.load(send_counts_ptr + dst * e_local + e, mask=mask_e, other=0).to(tl.int32)
 
         # Remote write: pca[e, src_rank] on destination.
-        src_ptr = send_counts_ptr + dst * e_local + e  # new pointer
-        remote_ptr = pca_ptr + e * world_size + src_rank
-        iris.put(
+        src_ptr = send_counts_ptr + dst * e_local + e  # new pointer 
+        remote_ptr = pca_ptr + e * world_size + src_rank 
+               
+             
+        iris.put( 
             src_ptr,            # from_ptr: pointer
             remote_ptr,         # to_ptr: pointer
             from_rank=src_rank,
             to_rank=dst,
+            
             heap_bases=heap_bases,
             mask=mask_e,        
         )
 
+
     # Signal completion to destination (release semantics).
-    iris.atomic_add(
+    iris.atomic_add( 
         counts_ready_ptr,
         1,
         src_rank,
@@ -64,16 +71,19 @@ def counts_exchange_kernel(
         sem="release",
         scope="sys",
     )
+    # spin wait on elocal variables that waits
 
-# Step-2 kernel: token exchange (with local spin-wait on counts_ready) which in the run may cause busy wait right
+# Step-2 kernel: token exchange with the original logic
 @triton.jit
 def tokens_exchange_kernel(
-    send_ptr,   # [sum_send, H]
-    send_counts_ptr,    # [W, E] int32 local
-    dst_offsets_ptr,    # [W] int32 local
-    expert_offs_ptr,    # [W, E] int32 local
-    token_buf_ptr,  # [E, W, CAP, H] symmetric on dst
-    token_sync_ptr, # [E] int32 symmetric on dst
+    send_ptr,            # [sum_send, H]
+    send_counts_ptr,     # [W, E] int32 local
+    dst_offsets_ptr,     # [W] int32 local
+    expert_offs_ptr,     # [W, E] int32 local (prefix within dst block)
+    token_buf_ptr,       # [E, W, CAP, H] symmetric on dst
+    token_sync_ptr,      # [E] int32 symmetric on dst
+    tile_counter_ptr,    # [E, W] int32 LOCAL scratch on src (we repurpose it!)
+        ##
     heap_bases,
     #*,
     src_rank: tl.constexpr,
@@ -81,60 +91,82 @@ def tokens_exchange_kernel(
     e_local: tl.constexpr,
     CAP: tl.constexpr,
     hidden_dim: tl.constexpr,
-    BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    dst = tl.program_id(0) # destination rank
-    expert = tl.program_id(1) # destination-local expert index
+    # grid = (dst, expert, token_id)
+    dst    = tl.program_id(0)
+    expert = tl.program_id(1)
+    tid    = tl.program_id(2)  # token row id within this (dst, expert)
 
-    # How many rows to send for this (dst, expert)
+  
+
+    # how many rows to send to (dst, expert)
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
-
-    # Base row offset into packed send_ptr for this (dst, expert)
-    dst_base = tl.load(dst_offsets_ptr + dst).to(tl.int32)
-    e_off = tl.load(expert_offs_ptr + dst * e_local + expert).to(tl.int32)
-    send_base = dst_base + e_off
-
-    # Remote base for token_buf[expert, src_rank, 0, 0] on destination
-    # Flatten: (((expert * world + src_rank) * CAP + m) * H + k)
-    remote_base = (expert * world_size + src_rank) * CAP * hidden_dim
-
-    # Copy up to CAP rows; rows beyond n are masked (padding remains zero)
-    for m0 in tl.static_range(0, CAP, BLOCK_M):
-        offs_m = m0 + tl.arange(0, BLOCK_M)
-        m_mask = offs_m < n
-        row_ids = (send_base + offs_m).to(tl.int32)
-
-        for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
-            offs_k = k0 + tl.arange(0, BLOCK_K)
-            k_mask = offs_k < hidden_dim
-
-            send_ptrs = send_ptr + row_ids[:, None] * hidden_dim + offs_k[None, :]
-            remote_ptrs = token_buf_ptr + remote_base + offs_m[:, None] * hidden_dim + offs_k[None, :]
-
-            iris.put(
-                send_ptrs,      # new pointer
-                remote_ptrs,    # new pointer
-                from_rank=src_rank,
-                to_rank=dst,
-                heap_bases=heap_bases,
-                mask=m_mask[:, None] & k_mask[None, :],
-            )
-
-    # Signal completion for this expert on destination (release semantics).
-    # IMPORTANT: even if n == 0, we still increment once so dst can reach world_size.
-    iris.atomic_add(
-        token_sync_ptr + expert,
-        1,
-        src_rank,
-        dst,
-        heap_bases,
-        sem="release",
-        scope="sys",
-    )
-
+    n_eff = tl.minimum(n, tl.full((), CAP, tl.int32))
     
+    # If no tokens: ONE program (tid==0) sends completion signal.
+    if tid == 0:
+        if n_eff == 0:
+            iris.atomic_add(
+                token_sync_ptr + expert, 1,
+                src_rank, dst, heap_bases,
+                sem="release", scope="sys",
+            )
+            return
 
+    # Only valid token-ids participate
+    if tid >= n_eff:
+        return
+
+    # send row index in packed send payload
+    dst_base  = tl.load(dst_offsets_ptr + dst).to(tl.int32)
+    e_off     = tl.load(expert_offs_ptr + dst * e_local + expert).to(tl.int32)
+    send_row  = dst_base + e_off + tid
+
+    # remote base for this (expert, src_rank) slice on destination
+    # [FIX] Cast to int64 to avoid overflow when CAP*H is large (>2GB)
+    remote_base = (expert.to(tl.int64) * world_size + src_rank) * CAP * hidden_dim
+    remote_row  = tid  # place at row=tid inside [CAP, H]
+
+    # copy one token row, BLOCK_K across hidden dim
+    for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < hidden_dim
+
+        send_ptrs   = send_ptr + send_row * hidden_dim + offs_k
+        remote_ptrs = token_buf_ptr + remote_base + remote_row * hidden_dim + offs_k
+
+        iris.put(
+            send_ptrs,
+            remote_ptrs,
+            from_rank=src_rank,
+            to_rank=dst,
+            heap_bases=heap_bases,
+            mask=k_mask,
+        )
+
+    # local completion accounting (ON SRC GPU)
+    # tile_counter_ptr used as LOCAL scratch: tile_counter[expert, dst] counts completed tokens
+    ctr_ptr = tile_counter_ptr + expert * world_size + dst
+    tl.atomic_add(ctr_ptr, 1, sem="release", scope="sys")
+
+    # ONE program spins until all tokens for this (dst, expert) done, then signals dst.token_sync[expert] += 1
+    if tid == 0:
+        # stage=1 : entering spin
+        # spin wait
+        v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='sys')
+        ## For some reason, without it, spin-lock in 163 deadlocks. ##
+        tl.debug_barrier()            
+        while v != n_eff:
+            v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='sys')
+
+        iris.atomic_add(
+            token_sync_ptr + expert, 1,
+            src_rank, dst, heap_bases,
+            sem="release", scope="sys",
+        )
+  
+"""
 @triton.jit
 def token_shuffle(
     pca_cumsum_ptr, pca_ptr, ## Both of size: [E, world_size]
@@ -146,24 +178,24 @@ def token_shuffle(
     BLOCK_X: tl.contexpr  ## We have 1-d blocks only.
 ):
     """
-    Triton kernel that reshuffles data post all-to-all (prior to expert compute) 
-    to eliminate zero-padding.
+    #Triton kernel that reshuffles data post all-to-all (prior to expert compute) 
+    #to eliminate zero-padding.
 
-    Args:
-        pca_cumsum_ptr (Tensor): [E, world_size]-sized physical counts array. 
-            pca_cumsum_ptr[i, j] = x means x tokens 
-        pca_ptr (Tensor): [E, world_size]-sized physical counts array.
-            pca_ptr[i, j] = x represents that x tokens are routed from device j
-            to expert i on the current rank.
-        token_buffer_ptr (Tensor): [E, world_size, capacity, hidden_dim]-sized tensor.
-            the output buffer that the all-to-all writes to.
-        token_sync_ptr (Tensor): [E]-sized tensor. These are synchronization variables
-            set by the prior all-to-all to ensure correctness.
-        E (int): number of *local* experts.
-        world_size (int): number of participating ranks.
-        mxa (int): maximum capaicty (2nd dimension of the token_buffer_ptr array).
-        hidden_dim (int): token hidden-dimensions.
-    """
+    #Args:
+    #    pca_cumsum_ptr (Tensor): [E, world_size]-sized physical counts array. 
+    #        pca_cumsum_ptr[i, j] = x means x tokens 
+    #    pca_ptr (Tensor): [E, world_size]-sized physical counts array.
+    #        pca_ptr[i, j] = x represents that x tokens are routed from device j
+    #        to expert i on the current rank.
+    #    token_buffer_ptr (Tensor): [E, world_size, capacity, hidden_dim]-sized tensor.
+    #        the output buffer that the all-to-all writes to.
+    #    token_sync_ptr (Tensor): [E]-sized tensor. These are synchronization variables
+    #        set by the prior all-to-all to ensure correctness.
+    #    E (int): number of *local* experts.
+    #    world_size (int): number of participating ranks.
+    #    mxa (int): maximum capaicty (2nd dimension of the token_buffer_ptr array).
+    #    hidden_dim (int): token hidden-dimensions.
+"""
     expert = tl.program_id(0)
     dev_id = tl.program_id(1)
     token_id = tl.program_id(2)
@@ -211,20 +243,20 @@ def grouped_gemm(
     BLOCK_SIZE_K: tl.constexpr,
 ):
     """
-    This kernel implements a grouped-gemm on the input token-buffers.
+    #This kernel implements a grouped-gemm on the input token-buffers.
 
-    Args:
-        token_ptrs (Tensor): [S, hidden_dim]-sized array. S is the packed
-            number of tokens (no zero-padding) post data-shuffling.
-        expert_weights (Tensor): [hidden_dim, expert_hidden_dim]-sized array. 
-            This represents each experts' weights.
-        output_ptrs (Tensor): [S, expert_hidden_dim]-sized array. Buffer to store
-            the results of processing the input tokens with expert weights.
-        expert_tkn_cnt_ptr (Tensor): [E]-sized array representing the tokens routed 
-            to expert i on the current rank. 
+    #Args:
+    #    token_ptrs (Tensor): [S, hidden_dim]-sized array. S is the packed
+    #        number of tokens (no zero-padding) post data-shuffling.
+    #    expert_weights (Tensor): [hidden_dim, expert_hidden_dim]-sized array. 
+    #        This represents each experts' weights.
+    #    output_ptrs (Tensor): [S, expert_hidden_dim]-sized array. Buffer to store
+    #        the results of processing the input tokens with expert weights.
+    #    expert_tkn_cnt_ptr (Tensor): [E]-sized array representing the tokens routed 
+    #        to expert i on the current rank. 
         
-        Rest of the arguments are self-explanatory.
-    """
+    #    Rest of the arguments are self-explanatory.
+"""
     tile_idx = tl.program_id(0)
     last_problem_end = 0
     for g in range(expert_cnt):
@@ -275,5 +307,5 @@ def grouped_gemm(
 
         # get ready to go to the next gemm problem
         last_problem_end = last_problem_end + num_tiles
-
+    """
 

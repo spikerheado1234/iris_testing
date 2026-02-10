@@ -10,11 +10,73 @@ import torch.distributed as dist
 from dataclasses import dataclass
 
 
+def nvtx_push(msg):
+    torch.cuda.nvtx.range_push(msg)
+
+def nvtx_pop():
+    torch.cuda.nvtx.range_pop()
+
+# judging and checking cap
+def _allreduce_max_i32(x: torch.Tensor) -> torch.Tensor:
+    y = x.clone()
+    dist.all_reduce(y, op=dist.ReduceOp.MAX)
+    return y
+
+
+def _sync_and_check(ok_flag: torch.Tensor) -> int:
+    ok_global = _allreduce_min_i32(ok_flag).item()
+    if ok_global == 1:
+        dist.barrier()
+    return ok_global
+
+def _allreduce_min_i32(x: torch.Tensor) -> torch.Tensor:
+    y = x.clone()
+    dist.all_reduce(y, op=dist.ReduceOp.MIN)
+    return y
 
 def _assert_cuda_int32(x: torch.Tensor, name: str) -> None:
     
     assert x.is_cuda, f"{name} must be CUDA"
     assert x.dtype == torch.int32, f"{name} must be int32"
+
+
+
+def _build_dst_offsets(send_counts: torch.Tensor) -> torch.Tensor:
+    """dst_offsets[dst] = prefix sum of total tokens to earlier destinations."""
+    # send_counts: [world, E_local] int32
+    send_dst_sizes = send_counts.sum(dim=1).to(torch.int32)
+    dst_offsets = (torch.cumsum(send_dst_sizes, dim=0) - send_dst_sizes).to(torch.int32)
+    return dst_offsets.contiguous()
+
+
+def _masked_stats(
+    custom_buf: torch.Tensor,
+    base_buf: torch.Tensor,
+    counts_mat: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute max|diff| and sums over ONLY the valid (non-padding) region.
+
+    custom_buf/base_buf: [E, world, CAP, H]
+    counts_mat:           [E, world]  (counts_mat[e, src] = number of valid rows)
+
+    Returns: (max_diff, sum_custom, sum_base) as 0-dim float32 tensors on GPU.
+    """
+    assert custom_buf.shape == base_buf.shape
+    E, W, CAP, H = custom_buf.shape
+
+    # mask[e, src, m] = (m < counts_mat[e, src])
+    m = torch.arange(CAP, device=custom_buf.device, dtype=torch.int32)[None, None, :]
+    mask = (m < counts_mat.to(torch.int32)[:, :, None]).unsqueeze(-1)  # [E, W, CAP, 1]
+
+    diff = (custom_buf - base_buf).abs().to(torch.float32)
+    diff_masked = diff * mask.to(torch.float32)
+
+    max_diff = diff_masked.max()
+
+    sum_custom = (custom_buf.to(torch.float32) * mask.to(torch.float32)).sum()
+    sum_base = (base_buf.to(torch.float32) * mask.to(torch.float32)).sum()
+
+    return max_diff, sum_custom, sum_base
 
 # Step-1/2 run wrapper
 def build_expert_offsets(send_counts: torch.Tensor) -> torch.Tensor:
@@ -34,17 +96,20 @@ def build_expert_offsets(send_counts: torch.Tensor) -> torch.Tensor:
 @dataclass
 class ShmemBuffers:
     # Step-1 outputs / sync
-    pca: torch.Tensor  # [E, world] int32 (symmetric)
-    counts_ready: torch.Tensor  # [1] int32 (symmetric)
+    pca: torch.Tensor          # [E, world] int32 (symmetric)
+    counts_ready: torch.Tensor # [1] int32 (symmetric)
 
     # Step-2 outputs / sync
-    token_buf: torch.Tensor  # [E, world, CAP, H] (symmetric)
-    token_sync: torch.Tensor  # [E] int32 (symmetric)
+    token_buf: torch.Tensor     # [E, world, CAP, H] (symmetric)
+    token_sync: torch.Tensor    # [E] int32 (symmetric)
+    tile_counter: torch.Tensor  # [E, world] int32 (symmetric)  <-- NEW
 
-    # Cached heap bases (IRIS addressing)
+    # Cached heap bases
     heap_bases: torch.Tensor
 
+
     
+
 def alloc_shmem_buffers(
     shmem,
     world_size: int,
@@ -52,32 +117,31 @@ def alloc_shmem_buffers(
     capacity: int,
     hidden_dim: int,
     token_dtype: torch.dtype,
-) -> ShmemBuffers:
-    """
-    Allocate symmetric buffers with fixed shapes.
-    """
-
-    # pca[e, src] = counts for this device's local expert e sent by src
+) -> ShmemBuffers:# new shmem buffers
+    # Step-1
     pca = shmem.zeros((e_local, world_size), dtype=torch.int32, device="cuda")
-
-    # counts_ready becomes == world_size once all senders finished writing counts.
     counts_ready = shmem.zeros((1,), dtype=torch.int32, device="cuda")
 
-    # token_buf[e, src, m, :] (m in [0, CAP)) holds tokens from src for expert e.
+    # Step-2
     token_buf = shmem.zeros((e_local, world_size, capacity, hidden_dim), dtype=token_dtype, device="cuda")
-
-    # token_sync[e] becomes == world_size once all senders finished sending tokens for expert e.
     token_sync = shmem.zeros((e_local,), dtype=torch.int32, device="cuda")
 
-    heap_bases = shmem.get_heap_bases()
+    # NEW: per-(expert,src) tile counter on dst
+    tile_counter = shmem.zeros((e_local, world_size), dtype=torch.int32, device="cuda")
 
+    heap_bases = shmem.get_heap_bases()
     return ShmemBuffers(
         pca=pca,
         counts_ready=counts_ready,
         token_buf=token_buf,
         token_sync=token_sync,
+        tile_counter=tile_counter,   # <-- NEW
         heap_bases=heap_bases,
     )
+
+
+
+@dataclass
 class CountsBuffers:
     pca: torch.Tensor
     counts_ready: torch.Tensor
@@ -96,6 +160,8 @@ def reset_token_buf_debug(tb: TokenBuffers) -> None:
 class TokenBuffers:
     token_buf: torch.Tensor
     token_sync: torch.Tensor
+    tile_counter: torch.Tensor  # <-- NEW
+
 
 def alloc_counts_buffers(shmem, world_size: int, e_local: int) -> CountsBuffers:
     pca = shmem.zeros((e_local, world_size), dtype=torch.int32, device="cuda")
@@ -113,7 +179,8 @@ def alloc_token_buffers(
 ) -> TokenBuffers:
     token_buf = shmem.zeros((e_local, world_size, capacity, hidden_dim), dtype=token_dtype, device="cuda")
     token_sync = shmem.zeros((e_local,), dtype=torch.int32, device="cuda")
-    return TokenBuffers(token_buf=token_buf, token_sync=token_sync)
+    tile_counter = shmem.zeros((e_local, world_size), dtype=torch.int32, device="cuda")  # <-- NEW
+    return TokenBuffers(token_buf=token_buf, token_sync=token_sync, tile_counter=tile_counter)
 
 def compute_capacity_from_pca(pca: torch.Tensor) -> int:
     cap = pca.max().to(torch.int32)
@@ -259,3 +326,4 @@ def gen_local_weights(
     w = torch.empty((e_local, hidden_dim, out_dim), dtype=dtype, device=device)
     torch.nn.init.normal_(w, mean=0.0, std=0.02)
     return w
+
