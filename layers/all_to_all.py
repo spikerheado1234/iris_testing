@@ -1,8 +1,6 @@
 import torch
 import torch.distributed as dist
 import triton
-# from .kernels import counts_exchange_kernel, tokens_exchange_kernel, build_expert_offsets
-
 
 from kernels import counts_exchange_kernel, tokens_exchange_kernel
 from utils import build_expert_offsets, _assert_cuda_int32
