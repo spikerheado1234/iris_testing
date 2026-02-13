@@ -209,30 +209,31 @@ def counts_exchange_pull(
     dev_id = tl.program_id(0)
 
     iris.get(
-        cnts + src_rank * e_local + tl.arange(0, e_local)[None, :],
-        local_expert_cnts + dev_id * e_local + tl.arange(0, e_local)[None, :],
-        from_rank=dev_id,
-        to_rank=src_rank,
+        cnts + src_rank * e_local + tl.arange(0, BLOCK_M),
+        local_expert_cnts + dev_id * e_local + tl.arange(0, BLOCK_M),
+        from_rank=src_rank,
+        to_rank=dev_id,
         heap_bases=heap_bases,
-        mask=None
+        mask=tl.arange(0, BLOCK_M) < e_local
     )
 
     iris.get(
         offsets + src_rank,
         local_expert_offset_idxs + dev_id,
-        from_rank=dev_id,
-        to_rank=src_rank,
+        from_rank=src_rank,
+        to_rank=dev_id,
         heap_bases=heap_bases,
         mask=None
     )
 
-    tl.atomic_add(cnt_exchange_sync, 1, sem="release", scope='gpu')
+    tl.atomic_add(cnt_exchange_sync, 1, sem="release", scope='sys')
 
     ## Spin-wait till completion, required for correctness. ##
     ws = tl.full([], world_size, dtype=tl.int32)
-    v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem='acquire', scope='gpu')
+    v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem='acquire', scope='sys')
+    tl.debug_barrier()
     while v != ws:
-        v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem='acquire', scope='gpu')
+        v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem='acquire', scope='sys')
 
 ## TODO(ahangupta): if this consumes too much runtime, we can migrate this into
 ##                      a triton kernel as well.
@@ -261,12 +262,12 @@ def roll_cum_sum(cnts, local_expert_offset_idxs):
     ## This produces the write_meta array. ##
     cnts_transpose = torch.transpose(cnts, 0, 1)
     prev_shape = cnts_transpose.shape
-    write_meta = torch.transpose(torch.roll(torch.cumsum(cnts_transpose.reshape(-1), dim=0), 1).reshape(prev_shape), 0, 1)
+    write_meta = torch.transpose(torch.roll(torch.cumsum(cnts_transpose.reshape(-1), dim=0), 1).reshape(prev_shape), 0, 1).contiguous()
     write_meta[0, 0] = 0  ## Since we start with 0. 
 
     ## This produces the read_meta array. ##
     read_meta = torch.roll(torch.cumsum(cnts, dim=-1) + local_expert_offset_idxs[:, None], 1, dims=-1)
-    read_meta[:, 0] = local_expert_offset_idxs[:, None]
+    read_meta[:, 0] = local_expert_offset_idxs
 
     return read_meta, write_meta
 
@@ -319,8 +320,8 @@ def token_exchange_pull(
         iris.get(
             tokens + from_ptrs,
             gathered_tokens + to_ptrs,
-            from_rank=dev_id,
-            to_rank=src_rank,
+            from_rank=src_rank,
+            to_rank=dev_id,
             heap_bases=heap_bases,
             mask=tl.arange(0, BLOCK_M)+k*BLOCK_M < hidden_dim
         )

@@ -59,13 +59,6 @@ class AllToAllGatherOp(torch.autograd.Function):
             e_local=e_local,
             BLOCK_M=BLOCK_M
         )
-
-        #print(f'local_expert_cnts sum: {local_expert_cnts.sum()}, local_expert_offset_idxs: {local_expert_offset_idxs.sum()} rank: {dist.get_rank()}')
-
-        #print(f'gpu: {dist.get_rank()}, reached: a')
-
-        #print(f'local_expert_cnts sum: {local_expert_cnts.sum()}, local_expert_offset_idxs: {local_expert_offset_idxs.sum()} rank: {dist.get_rank()}')
-
         ## Then, intermediate ops. ##
         read_meta, write_meta = roll_cum_sum(local_expert_cnts, local_expert_offset_idxs)
 

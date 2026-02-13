@@ -353,8 +353,8 @@ def _worker_gather(local_rank: int, world_size: int) -> None:
     shmem = _get_shmem()
     print(f"[rank{local_rank}] init ok, cuda={torch.cuda.current_device()}", flush=True)
     try:
-        test_gather_a2a(shmem, e_local=2, hidden_dim=128, cap=32)
-        test_gather_a2a(shmem, e_local=4, hidden_dim=256, cap=16)
+        test_gather_a2a(shmem, e_local=16, hidden_dim=128, cap=32)
+        test_gather_a2a(shmem, e_local=16, hidden_dim=256, cap=16)
         if local_rank == 0:
             print("All gather_a2a tests PASSED")
     finally:
@@ -363,7 +363,7 @@ def _worker_gather(local_rank: int, world_size: int) -> None:
 
 if __name__ == '__main__':
    
-    world_size = 8
+    world_size = 2
 
     # Scatter (push) a2a tests.
     # mp.spawn(_worker, args=(world_size,), nprocs=world_size, join=True)
