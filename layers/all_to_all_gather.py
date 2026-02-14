@@ -46,7 +46,7 @@ class AllToAllGatherOp(torch.autograd.Function):
         cnt_exchange_sync = torch.zeros(1, dtype=torch.int32).to(tokens.device)
 
         ## Next, launch the first metadata exchange. ##
-        BLOCK_M = 16
+        BLOCK_M = 64
         counts_exchange_pull[(dist.get_world_size(),)](
             cnts=cnts,
             offsets=offsets,
@@ -78,7 +78,8 @@ class AllToAllGatherOp(torch.autograd.Function):
             world_size=dist.get_world_size(),
             e_local=e_local,
             hidden_dim=tokens.shape[-1],
-            BLOCK_M=256 
+            BLOCK_M=1024,
+            num_warps=8 
         )
 
         return gathered_tokens

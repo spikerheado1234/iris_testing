@@ -356,7 +356,7 @@ def _worker_gather(local_rank: int, world_size: int) -> None:
         test_gather_a2a(shmem, e_local=16, hidden_dim=128, cap=32)
         test_gather_a2a(shmem, e_local=16, hidden_dim=256, cap=16)
         if local_rank == 0:
-            print("All gather_a2a tests PASSED")
+            print("All gather_a2a tests finished")
     finally:
         dist.destroy_process_group()
 

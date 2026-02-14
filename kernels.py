@@ -164,6 +164,17 @@ def tokens_exchange_kernel(
 ## These Kernels implement a gather approach (pulling the data.)
 ###############################################################
 
+#@triton.autotune(
+#    configs=[
+#        triton.Config({'BLOCK_M': 16}, num_warps=2),
+#        triton.Config({'BLOCK_M': 16}, num_warps=4),
+#        triton.Config({'BLOCK_M': 32}, num_warps=2),
+#        triton.Config({'BLOCK_M': 32}, num_warps=4),
+#        triton.Config({'BLOCK_M': 64}, num_warps=2),
+#        triton.Config({'BLOCK_M': 64}, num_warps=4),
+#    ],
+#    key=['e_local'],
+#)
 @triton.jit
 def counts_exchange_pull(
     ############################################
@@ -271,6 +282,23 @@ def roll_cum_sum(cnts, local_expert_offset_idxs):
 
     return read_meta, write_meta
 
+#@triton.autotune(
+#    configs=[
+#        triton.Config({'BLOCK_M': 32},  num_warps=2),
+#        triton.Config({'BLOCK_M': 32},  num_warps=4),
+#        triton.Config({'BLOCK_M': 32},  num_warps=8),
+#        triton.Config({'BLOCK_M': 64},  num_warps=2),
+#        triton.Config({'BLOCK_M': 64},  num_warps=4),
+#        triton.Config({'BLOCK_M': 64},  num_warps=8),
+#        triton.Config({'BLOCK_M': 128}, num_warps=2),
+#        triton.Config({'BLOCK_M': 128}, num_warps=4),
+#        triton.Config({'BLOCK_M': 128}, num_warps=8),
+#        triton.Config({'BLOCK_M': 256}, num_warps=2),
+#        triton.Config({'BLOCK_M': 256}, num_warps=4),
+#        triton.Config({'BLOCK_M': 256}, num_warps=8),
+#    ],
+#    key=['hidden_dim'],
+#)
 @triton.jit
 def token_exchange_pull(
     ########################################
