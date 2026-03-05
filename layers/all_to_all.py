@@ -1,8 +1,6 @@
 import torch
 import torch.distributed as dist
 import triton
-# from .kernels import counts_exchange_kernel, tokens_exchange_kernel, build_expert_offsets
-
 
 from kernels import counts_exchange_kernel, tokens_exchange_kernel
 from utils import build_expert_offsets, _assert_cuda_int32
@@ -113,11 +111,14 @@ class AllToAllOp(torch.autograd.Function):
         )
         
      
-       # Stage-2: token exchange (per-token blocks)
+        # [NEW] alloc a tensor for timing
+        debug_time = torch.zeros((world_size * e_local,), dtype=torch.int64, device=tokens.device)
+        # Stage-2: token exchange (per-token blocks)
           
         tokens_exchange_kernel[(world_size, e_local, capacity)](
         tokens, dest_counts, dst_offsets, expert_offs,
         token_buf, token_sync, tile_counter,
+        debug_time,
         heap_bases,
         src_rank=rank,
         world_size=world_size,
@@ -127,6 +128,8 @@ class AllToAllOp(torch.autograd.Function):
         BLOCK_K=block_k,
         num_warps=token_num_warps,
     )
+        # save for print
+        _LAST_DBG["spin_cycles"] = debug_time.clone()
         #return only the layer output (token_buf).
         return token_buf
 

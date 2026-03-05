@@ -15,7 +15,23 @@ H = hidden_dimension
 CAP = max_{e,s} pca[e,s] 
 Capcity in real moe 
 """
+@triton.jit
+# inline_asm for time measurements of all the atmoic instructions
+def get_amdgpu_clock():
+    # use s_memrealtime to get realtime AMD GPU (64-bit)
+    # s_waitcnt lgkmcnt(0) to ennsure all memory operations are end before read
+    return tl.inline_asm_elementwise(
+        "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)",
+        "=s", # output scalar register
+        [],
+        dtype=tl.int64,
+        is_pure=False,
+        pack=1
+    )
 
+################################################################
+## These Kernels implement a scatter approach (pushing the data.)
+###############################################################
 
 # Step-1 kernel: counts exchange
 @triton.jit
@@ -24,7 +40,6 @@ def counts_exchange_kernel(
     pca_ptr,  # [E, world] int32 (symmetric on dst)
     counts_ready_ptr,  # [1] int32 (symmetric on dst)
     heap_bases,
-    #*,
     src_rank: tl.constexpr,
     world_size: tl.constexpr,
     e_local: tl.constexpr,
@@ -40,22 +55,16 @@ def counts_exchange_kernel(
     for e0 in tl.static_range(0, e_local, BLOCK_E):
         e = e0 + tl.arange(0, BLOCK_E)
         mask_e = e < e_local
-      
-
-        # Local read: send_counts[dst, e]
-        #vals = tl.load(send_counts_ptr + dst * e_local + e, mask=mask_e, other=0).to(tl.int32)
 
         # Remote write: pca[e, src_rank] on destination.
         src_ptr = send_counts_ptr + dst * e_local + e  # new pointer 
         remote_ptr = pca_ptr + e * world_size + src_rank 
-               
              
         iris.put( 
             src_ptr,            # from_ptr: pointer
             remote_ptr,         # to_ptr: pointer
             from_rank=src_rank,
             to_rank=dst,
-            
             heap_bases=heap_bases,
             mask=mask_e,        
         )
@@ -83,9 +92,8 @@ def tokens_exchange_kernel(
     token_buf_ptr,       # [E, W, CAP, H] symmetric on dst
     token_sync_ptr,      # [E] int32 symmetric on dst
     tile_counter_ptr,    # [E, W] int32 LOCAL scratch on src (we repurpose it!)
-        ##
+    debug_time_ptr,      # [NEW] pointer used to write back timing data [W, E]
     heap_bases,
-    #*,
     src_rank: tl.constexpr,
     world_size: tl.constexpr,
     e_local: tl.constexpr,
@@ -152,10 +160,10 @@ def tokens_exchange_kernel(
 
     # ONE program spins until all tokens for this (dst, expert) done, then signals dst.token_sync[expert] += 1
     if tid == 0:
-        # stage=1 : entering spin
-        # spin wait
+        # [NEW] 1. record while the spin lock begin
+        start_time = get_amdgpu_clock()
+
         v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='sys')
-        ## For some reason, without it, spin-lock in 163 deadlocks. ##
         tl.debug_barrier()            
         while v != n_eff:
             v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='sys')
@@ -165,7 +173,215 @@ def tokens_exchange_kernel(
             src_rank, dst, heap_bases,
             sem="release", scope="sys",
         )
-  
+        
+        # [NEW] 2. record the end time and compute the cycles spent in the spin lock
+        end_time = get_amdgpu_clock()
+        cycles = end_time - start_time
+        
+        # [NEW] 3. store the spent cycles back to shared memory (indexed by dst and expert)
+        debug_idx = dst * e_local + expert
+        tl.store(debug_time_ptr + debug_idx, cycles)
+ 
+################################################################
+## These Kernels implement a gather approach (pulling the data.)
+###############################################################
+
+#@triton.autotune(
+#    configs=[
+#        triton.Config({'BLOCK_M': 16}, num_warps=2),
+#        triton.Config({'BLOCK_M': 16}, num_warps=4),
+#        triton.Config({'BLOCK_M': 32}, num_warps=2),
+#        triton.Config({'BLOCK_M': 32}, num_warps=4),
+#        triton.Config({'BLOCK_M': 64}, num_warps=2),
+#        triton.Config({'BLOCK_M': 64}, num_warps=4),
+#    ],
+#    key=['e_local'],
+#)
+@triton.jit
+def counts_exchange_pull(
+    ############################################
+    ### These two buffers are for READING ONLY. 
+    ############################################
+    cnts,  # [world_size, expert_pack] (symmetric memory, addressable by all devices)
+    offsets, # [world_size] (symmetric memory, addressable by all devices)
+    ################################################
+    ### These three buffers are for Writing ONLY. 
+    ################################################
+    local_expert_cnts, # [world_size, expert_pack] (local memory)
+    local_expert_offset_idxs, # [world_size] (local memory)
+    cnt_exchange_sync, # [1] (unit-sized array in local memory)
+    heap_bases,
+    src_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    e_local: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """
+    This is the metadata exchange kernel. At the end of this kernel,
+    two important tensors are populated. 
+
+    1. local_expert_cnts -> [world_size, expert_pack] sized. local_expert_cnts[i, j] = x
+    indicates that device i will x tokens to this rank's local expert j.
+    2. local_expert_offset_idxs -> [world_size] sized. local_expert_offset_idxs[i] = x indicates
+    that device i's first token to be routed to this rank resides at index x.
+
+    Invariant: prior to launching this kernel, cnts and offsets must be populated by each device.
+    Moreover, the tokens should be reordered to be contiguous (with respect to experts). This means
+    that the tokens on each device should look like the following:
+    [
+    ---- token routed to expert 0 ----,
+    ---- token routed to expert 0 ----,
+    ---- token routed to expert 0 ----,
+    ---- token routed to expert 1 ----,
+    ---- token routed to expert 1 ----,
+    ---- token routed to expert 1 ----,
+    ...
+    ---- token routed to expert k ----
+    ]
+    """
+    dev_id = tl.program_id(0)
+
+    iris.get(
+        cnts + src_rank * e_local + tl.arange(0, BLOCK_M),
+        local_expert_cnts + dev_id * e_local + tl.arange(0, BLOCK_M),
+        from_rank=src_rank,
+        to_rank=dev_id,
+        heap_bases=heap_bases,
+        mask=tl.arange(0, BLOCK_M) < e_local
+    )
+
+    iris.get(
+        offsets + src_rank,
+        local_expert_offset_idxs + dev_id,
+        from_rank=src_rank,
+        to_rank=dev_id,
+        heap_bases=heap_bases,
+        mask=None
+    )
+
+    tl.atomic_add(cnt_exchange_sync, 1, sem="release", scope='sys')
+
+    ## Spin-wait till completion, required for correctness. ##
+    ws = tl.full([], world_size, dtype=tl.int32)
+    v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem='acquire', scope='sys')
+    tl.debug_barrier()
+    while v != ws:
+        v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem='acquire', scope='sys')
+
+## TODO(ahangupta): if this consumes too much runtime, we can migrate this into
+##                      a triton kernel as well.
+@torch.compile
+def roll_cum_sum(cnts, local_expert_offset_idxs):
+    """
+    This produces read/write metadata that we can use to index token tensors.
+    This will be called in between the metadata-kernel and the physical token 
+    exchange kernel.
+
+    Inputs:
+        1. cnts -> [world_size, expert_pack]. cnts[i, j] = x on device d indicates that
+                        device i will route x tokens to expert j that resides on d.
+        2. local_expert_offset_idxs -> [world_size]. local_expert_offset_idxs[i] = x on device d
+                                            indicates that the first token to be routed to d from device
+                                            i resides at index x.
+
+    Outputs:
+        1. read_meta -> [world_size, expert_pack]. read_meta[i, j] = x indicates that in device
+                            i's token buffer, the first token routed to expert j on this device lies at index x.
+        2. write_meta -> [world_size, expert_pack]. write_meta[i, j] = x indicates that in this device's 
+                            gathered_token buffer, the first token routed to expert j from device i should be written to 
+                            at index x.
+
+    """
+    ## This produces the write_meta array. ##
+    cnts_transpose = torch.transpose(cnts, 0, 1)
+    prev_shape = cnts_transpose.shape
+    write_meta = torch.transpose(torch.roll(torch.cumsum(cnts_transpose.reshape(-1), dim=0), 1).reshape(prev_shape), 0, 1).contiguous()
+    write_meta[0, 0] = 0  ## Since we start with 0. 
+
+    ## This produces the read_meta array. ##
+    read_meta = torch.roll(torch.cumsum(cnts, dim=-1) + local_expert_offset_idxs[:, None], 1, dims=-1)
+    read_meta[:, 0] = local_expert_offset_idxs
+
+    return read_meta, write_meta
+
+#@triton.autotune(
+#    configs=[
+#        triton.Config({'BLOCK_M': 32},  num_warps=2),
+#        triton.Config({'BLOCK_M': 32},  num_warps=4),
+#        triton.Config({'BLOCK_M': 32},  num_warps=8),
+#        triton.Config({'BLOCK_M': 64},  num_warps=2),
+#        triton.Config({'BLOCK_M': 64},  num_warps=4),
+#        triton.Config({'BLOCK_M': 64},  num_warps=8),
+#        triton.Config({'BLOCK_M': 128}, num_warps=2),
+#        triton.Config({'BLOCK_M': 128}, num_warps=4),
+#        triton.Config({'BLOCK_M': 128}, num_warps=8),
+#        triton.Config({'BLOCK_M': 256}, num_warps=2),
+#        triton.Config({'BLOCK_M': 256}, num_warps=4),
+#        triton.Config({'BLOCK_M': 256}, num_warps=8),
+#    ],
+#    key=['hidden_dim'],
+#)
+@triton.jit
+def token_exchange_pull(
+    ########################################
+    ### These buffers are for READING ONLY. 
+    ########################################
+    tokens, # [C, hidden_dim] -> symmetric memory.
+    read_meta, # [world_size, expert_pack] -> local memory.
+    write_meta, # [world_size, expert_pack] -> local memory.
+    local_expert_cnts, # [world_size, expert_pack] -> symmetric memory.
+    ########################################
+    ### These buffers are for WRITING ONLY. 
+    ########################################
+    gathered_tokens, # [C', hidden_dim] -> local memory.
+    token_sync, # [world_size, expert_pack] -> local memory.
+    ## Extraneous bits of information.
+    heap_bases,
+    src_rank,
+    world_size,
+    e_local,
+    hidden_dim: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    """
+    This kernel physically exchanges tokens after the metadata exchange stage.
+
+    It implements a "pull" a2a kernel, where device i gathers all its relevant tokens
+    from the other devices (rather than scattering its own tokens).
+    """
+    dev_id = tl.program_id(0)
+    expert_id = tl.program_id(1)
+    
+    ## This determines which token should move in shmem. ##
+    offset = tl.program_id(2)
+
+    if offset >= tl.load(local_expert_cnts + dev_id * e_local + expert_id):
+        ## Selectively predicate all blocks that are not required and
+        ##    over-provisioned.
+        return 
+
+    read_meta_ptrs = tl.load(read_meta + dev_id * e_local + expert_id) 
+    write_meta_ptrs = tl.load(write_meta + dev_id * e_local + expert_id)
+
+    from_ptrs = read_meta_ptrs * hidden_dim + offset * hidden_dim + tl.arange(0, BLOCK_M)
+    to_ptrs = write_meta_ptrs * hidden_dim + offset * hidden_dim + tl.arange(0, BLOCK_M)
+
+    for k in tl.range(tl.cdiv(hidden_dim, BLOCK_M)):
+        iris.get(
+            tokens + from_ptrs,
+            gathered_tokens + to_ptrs,
+            from_rank=src_rank,
+            to_rank=dev_id,
+            heap_bases=heap_bases,
+            mask=tl.arange(0, BLOCK_M)+k*BLOCK_M < hidden_dim
+        )
+
+        from_ptrs += BLOCK_M
+        to_ptrs += BLOCK_M
+
+    ## Now, we ring a bell to indicate completion. ##
+    tl.atomic_add(token_sync + dev_id * e_local + expert_id, 1, sem='release', scope='sys')
+
 """
 @triton.jit
 def token_shuffle(

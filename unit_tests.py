@@ -6,13 +6,15 @@ import time
 import iris
 import torch.multiprocessing as mp
 from layers.all_to_all import custom_a2a
+from layers.all_to_all_gather import gather_a2a
 # 4debug
 from layers.all_to_all import _LAST_DBG
 
 #from .layers.token_shuffle import shuffle
 #from .layers.expert import expert
 
-from utils import alloc_counts_buffers, alloc_token_buffers
+from utils import alloc_counts_buffers, alloc_token_buffers, _build_dst_offsets
+from baseline import exchange_counts_a2a, exchange_payload_a2a, init_baseline_buffers
 
 # 4 debug only
 import time
@@ -136,7 +138,7 @@ def gen_gemm_input(num_local_experts, token_hid_dim, expert_hid_dim):
 
 def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 32, threshold: float = 1e-2) -> bool:
     """
-       Routing pattern:
+      Routing pattern:
       Each src sends exactly `cap` rows to every (dst, local_expert).
       This makes expected placement deterministic and easy to check.
     """
@@ -149,7 +151,7 @@ def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 3
     dest_counts = torch.full((world_size, e_local), cap, device="cuda", dtype=torch.int32)
     dst_offsets = (torch.arange(world_size, device="cuda", dtype=torch.int32) * (e_local * cap)).contiguous()
 
-    # build unique-valued tokens so misplacement is detectable ---
+    # build unique-valued tokens so misplacement is detectable 
     total_rows = world_size * e_local * cap
     tokens = torch.empty((total_rows, hidden_dim), device="cuda", dtype=torch.bfloat16)
     for dst in range(world_size):
@@ -204,6 +206,16 @@ def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 3
     _spin_wait_counts(cb, world_size)
     _spin_wait_tokens(tb, world_size)
 
+    # new logic for timing
+    if "spin_cycles" in _LAST_DBG:
+        torch.cuda.synchronize() # ensure all done
+        cycles = _LAST_DBG["spin_cycles"].cpu()
+        valid_cycles = cycles[cycles > 0] # fliter the extra 0
+        if len(valid_cycles) > 0:
+            avg_c = valid_cycles.float().mean().item()
+            max_c = valid_cycles.max().item()
+            print(f">>> [Rank {rank}] e_local={e_local} Spin-lock cycles: AVG = {avg_c:.1f}, MAX = {max_c}")
+
     # gather inputs for expected mapping 
     gathered_in = [torch.empty_like(tokens) for _ in range(world_size)]
     dist.all_gather(gathered_in, tokens)
@@ -250,16 +262,122 @@ def test_gemm(total_expert_cnt, token_hid_dim, expert_hid_dim):
     return is_correct(custom_output, torch.stack(torch_out), 1e-2)
 
 
+def test_gather_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 32, threshold: float = 1e-2) -> bool:
+    """
+    Test the gather (pull) all-to-all against the PyTorch baseline.
+
+    Each rank builds a deterministic send payload where every token row
+    is filled with a unique value encoding (rank, dst, expert, token_id).
+    We run both the custom gather a2a and the baseline a2a, then compare
+    the gathered output tensors.
+    """
+    _require_dist()
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    device = torch.device(f"cuda:{rank}")
+
+    # --- Build deterministic routing: each rank sends `cap` tokens to every (dst, expert). ---
+    send_counts = torch.full((world_size, e_local), cap, device=device, dtype=torch.int32)
+    dst_offsets = _build_dst_offsets(send_counts)
+
+    total_rows = world_size * e_local * cap
+    tokens = torch.empty((total_rows, hidden_dim), device=device, dtype=torch.bfloat16)
+    for dst in range(world_size):
+        base = int(dst_offsets[dst].item())
+        for e in range(e_local):
+            for t in range(cap):
+                row = base + e * cap + t
+                val = float(rank * 1_000_000 + dst * 10_000 + e * 100 + t)
+                tokens[row].fill_(val)
+
+    # --- Allocate symmetric memory buffers for the gather a2a. ---
+    # cnts and offsets must live in symmetric memory so other ranks can read them.
+    shmem_cnts = shmem.zeros((world_size, e_local), dtype=torch.int64, device="cuda")
+    shmem_offsets = shmem.zeros((world_size,), dtype=torch.int64, device="cuda")
+    shmem_tokens = shmem.zeros((total_rows, hidden_dim), dtype=tokens.dtype, device="cuda")
+    heap_bases = shmem.get_heap_bases()
+
+    # Populate symmetric buffers with this rank's data.
+    shmem_cnts.copy_(send_counts.to(torch.int64))
+    shmem_offsets.copy_(dst_offsets.to(torch.int64))
+    shmem_tokens.copy_(tokens)
+
+    # Ensure all ranks have written their symmetric buffers before pulling.
+    shmem.barrier()
+
+    # --- Run custom gather a2a. ---
+    gathered = gather_a2a(shmem_cnts, shmem_offsets, heap_bases, e_local, shmem_tokens)
+    torch.cuda.synchronize()
+    shmem.barrier()
+
+    # --- Run baseline a2a to get expected result. ---
+    # exchange_counts_a2a gives us recv_counts[src, e] = tokens src sends to our expert e.
+    total_recv_upper = world_size * e_local * cap
+    base_bufs = init_baseline_buffers(
+        world_size, e_local, cap, hidden_dim, tokens.dtype, device, total_recv_upper,
+    )
+    recv_counts = exchange_counts_a2a(send_counts, base_bufs, strict_capacity=False, capacity=cap)
+    recv_flat, _, _ = exchange_payload_a2a(tokens, send_counts, recv_counts, base_bufs)
+    torch.cuda.synchronize()
+
+    # recv_flat is packed [src0_e0, src0_e1, ..., src1_e0, ...] which is expert-minor within each src.
+    # gathered is packed expert-major: [e0_src0, e0_src1, ..., e1_src0, ...] (from write_meta layout).
+    # Reorder baseline into the same expert-major layout for comparison.
+    expected = torch.zeros_like(gathered)
+    baseline_off = 0
+    # Build the same write_meta offsets the kernel uses.
+    # expert-major, device-minor: all tokens for expert 0 first, then expert 1, etc.
+    write_off = {}
+    running = 0
+    for e in range(e_local):
+        for src in range(world_size):
+            c = int(recv_counts[src, e].item())
+            write_off[(src, e)] = running
+            running += c
+
+    for src in range(world_size):
+        for e in range(e_local):
+            c = int(recv_counts[src, e].item())
+            if c > 0:
+                wo = write_off[(src, e)]
+                expected[wo:wo + c] = recv_flat[baseline_off:baseline_off + c]
+            baseline_off += c
+
+    # --- Compare. ---
+    if gathered.shape != expected.shape:
+        print(f"[rank{rank}] FAIL: shape mismatch gathered={gathered.shape} expected={expected.shape}")
+        return False
+
+    if not torch.allclose(gathered.float(), expected.float(), rtol=threshold, atol=threshold):
+        max_diff = (gathered.float() - expected.float()).abs().max().item()
+        print(f"[rank{rank}] FAIL: max_diff={max_diff}")
+        return False
+
+    if rank == 0:
+        print(f"[rank{rank}] gather_a2a test PASSED (e_local={e_local}, H={hidden_dim}, cap={cap})")
+    return True
+
+
+def _worker_gather(local_rank: int, world_size: int) -> None:
+    _init_dist_tcp(local_rank, world_size)
+    shmem = _get_shmem()
+    print(f"[rank{local_rank}] init ok, cuda={torch.cuda.current_device()}", flush=True)
+    try:
+        test_gather_a2a(shmem, e_local=16, hidden_dim=128, cap=32)
+        test_gather_a2a(shmem, e_local=16, hidden_dim=256, cap=16)
+        if local_rank == 0:
+            print("All gather_a2a tests finished")
+    finally:
+        dist.destroy_process_group()
+
+
 if __name__ == '__main__':
    
-    world_size = 8
-    mp.spawn(_worker, args=(world_size,), nprocs=world_size, join=True)
+    world_size = 2
 
+    # Scatter (push) a2a tests.
+    # mp.spawn(_worker, args=(world_size,), nprocs=world_size, join=True)
 
-    ## Some sample inputs to test out correctness. ##
-    #test_gemm(2, 24, 48)
-    #test_gemm(5, 128, 128)
-    
-    #est_custom_a2a(e_local=2, hidden_dim=128, cap=32)
-    #test_custom_a2a(e_local=4, hidden_dim=256, cap=16)
+    # Gather (pull) a2a tests.
+    mp.spawn(_worker_gather, args=(world_size,), nprocs=world_size, join=True)
     

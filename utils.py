@@ -312,6 +312,68 @@ def route_and_pack_padding_free(
 
     return send_payload, send_counts, dst_offsets, dst_sizes
 
+def route_and_pack_fixed(
+    tokens: torch.Tensor,
+    router: torch.Tensor,
+    topk: int,
+    world_size: int,
+    num_experts_total: int,
+    fixed_capacity: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    (Fixed-Block / Padded Routing) good for both version
+    """
+    assert tokens.is_cuda, "Expect CUDA tokens"
+    device = tokens.device
+    dtype = tokens.dtype
+
+    assert num_experts_total % world_size == 0, "num_experts_total must be divisible by world_size"
+    e_local = num_experts_total // world_size
+    hidden_dim = tokens.shape[-1]
+
+    # computing routing
+    routed_values = F.softmax(torch.einsum('th,he->te', tokens, router), dim=-1)
+    _, top_idxs = torch.topk(routed_values, topk, dim=-1)  # [T, topk]
+
+    # get tokens
+    buckets: List[List[List[torch.Tensor]]] = [
+        [[] for _ in range(e_local)] for _ in range(world_size)
+    ]
+    
+    for ti in range(tokens.shape[0]):
+        tok = tokens[ti]
+        for kk in range(topk):
+            ex = int(top_idxs[ti, kk].item())
+            dst = ex // e_local
+            el = ex - dst * e_local
+            buckets[dst][el].append(tok)
+
+    # make fixed payload and counts
+    total_rows = world_size * e_local * fixed_capacity
+    send_payload = torch.zeros((total_rows, hidden_dim), dtype=dtype, device=device)
+    # forced = fixed_capacity
+    send_counts = torch.full((world_size, e_local), fixed_capacity, dtype=torch.int32, device=device)
+    
+    dst_offsets = torch.zeros((world_size,), dtype=torch.int32, device=device)
+    dst_sizes = torch.full((world_size,), e_local * fixed_capacity, dtype=torch.int32, device=device)
+
+    # into Payload (with Zero-padding)
+    running = 0
+    for dst in range(world_size):
+        dst_offsets[dst] = running
+        for el in range(e_local):
+            n_actual = len(buckets[dst][el])
+            n_copy = min(n_actual, fixed_capacity) # tuncate if more than cap
+            if n_copy > 0:
+                chunk = torch.stack(buckets[dst][el][:n_copy], dim=0)
+                # calcculate start id for this block in the payload
+                start_idx = running + el * fixed_capacity
+                send_payload[start_idx : start_idx + n_copy] = chunk
+        running += e_local * fixed_capacity
+
+    return send_payload, send_counts, dst_offsets, dst_sizes
+
+
 def gen_local_weights(
     e_local: int,
     hidden_dim: int,
