@@ -15,6 +15,19 @@ H = hidden_dimension
 CAP = max_{e,s} pca[e,s] 
 Capcity in real moe 
 """
+@triton.jit
+# inline_asm for time measurements of all the atmoic instructions
+def get_amdgpu_clock():
+    # use s_memrealtime to get realtime AMD GPU (64-bit)
+    # s_waitcnt lgkmcnt(0) to ennsure all memory operations are end before read
+    return tl.inline_asm_elementwise(
+        "s_memrealtime $0\n\ts_waitcnt lgkmcnt(0)",
+        "=s", # output scalar register
+        [],
+        dtype=tl.int64,
+        is_pure=False,
+        pack=1
+    )
 
 ################################################################
 ## These Kernels implement a scatter approach (pushing the data.)
@@ -79,6 +92,7 @@ def tokens_exchange_kernel(
     token_buf_ptr,       # [E, W, CAP, H] symmetric on dst
     token_sync_ptr,      # [E] int32 symmetric on dst
     tile_counter_ptr,    # [E, W] int32 LOCAL scratch on src (we repurpose it!)
+    debug_time_ptr,      # [NEW] pointer used to write back timing data [W, E]
     heap_bases,
     src_rank: tl.constexpr,
     world_size: tl.constexpr,
@@ -111,6 +125,9 @@ def tokens_exchange_kernel(
     # Only valid token-ids participate
     if tid >= n_eff:
         return
+
+    # [NEW] Probes 0: record all 
+    t0 = get_amdgpu_clock()
 
     # send row index in packed send payload
     dst_base  = tl.load(dst_offsets_ptr + dst).to(tl.int32)
@@ -146,19 +163,51 @@ def tokens_exchange_kernel(
 
     # ONE program spins until all tokens for this (dst, expert) done, then signals dst.token_sync[expert] += 1
     if tid == 0:
-        # stage=1 : entering spin
-        # spin wait
+        # [NEW] probe1. record while the spin lock begin
+        t1 = get_amdgpu_clock()
+
         v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='sys')
-        ## For some reason, without it, spin-lock in 152 deadlocks. ##
         tl.debug_barrier()            
         while v != n_eff:
             v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='sys')
+
+        # [NEW] probe 2: all threads ends
+        t2 = get_amdgpu_clock()
 
         iris.atomic_add(
             token_sync_ptr + expert, 1,
             src_rank, dst, heap_bases,
             sem="release", scope="sys",
         )
+        
+        # [NEW] probe 3: cross gpu signal sent
+        t3 = get_amdgpu_clock()
+
+       # [NEW] calculated the time cost and into the share mem
+        debug_idx = (dst * e_local + expert) * 3  # *3 here record all 3 data
+        tl.store(debug_time_ptr + debug_idx + 0, t1 - t0) # Phase 1: iris.put 
+        tl.store(debug_time_ptr + debug_idx + 1, t2 - t1) # Phase 2: Spin-lock time
+        tl.store(debug_time_ptr + debug_idx + 2, t3 - t2) # Phase 3: Remote Atomic time
+
+## THIS KERNEL make timing realizble
+@triton.jit
+def receiver_wait_kernel(
+    token_sync_ptr,        # [E_local] int32 symmetric/local visible
+    recv_wait_cycles_ptr,  # [E_local] int64 local
+    world_size: tl.constexpr,
+):
+    expert = tl.program_id(0)
+
+    t0 = get_amdgpu_clock()
+
+    ws = tl.full((), world_size, tl.int32)
+    v = tl.atomic_cas(token_sync_ptr + expert, ws, ws, sem="acquire", scope="sys")
+    tl.debug_barrier()
+    while v != ws:
+        v = tl.atomic_cas(token_sync_ptr + expert, ws, ws, sem="acquire", scope="sys")
+
+    t1 = get_amdgpu_clock()
+    tl.store(recv_wait_cycles_ptr + expert, t1 - t0)
  
 ################################################################
 ## These Kernels implement a gather approach (pulling the data.)

@@ -5,10 +5,10 @@ import os
 import time
 import iris
 import torch.multiprocessing as mp
-from layers.all_to_all import custom_a2a
+from layers.all_to_all_scatter import custom_a2a
 from layers.all_to_all_gather import gather_a2a
 # 4debug
-from layers.all_to_all import _LAST_DBG
+from layers.all_to_all_scatter import _LAST_DBG
 
 #from .layers.token_shuffle import shuffle
 #from .layers.expert import expert
@@ -138,7 +138,7 @@ def gen_gemm_input(num_local_experts, token_hid_dim, expert_hid_dim):
 
 def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 32, threshold: float = 1e-2) -> bool:
     """
-       Routing pattern:
+      Routing pattern:
       Each src sends exactly `cap` rows to every (dst, local_expert).
       This makes expected placement deterministic and easy to check.
     """
@@ -151,7 +151,7 @@ def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 3
     dest_counts = torch.full((world_size, e_local), cap, device="cuda", dtype=torch.int32)
     dst_offsets = (torch.arange(world_size, device="cuda", dtype=torch.int32) * (e_local * cap)).contiguous()
 
-    # build unique-valued tokens so misplacement is detectable ---
+    # build unique-valued tokens so misplacement is detectable 
     total_rows = world_size * e_local * cap
     tokens = torch.empty((total_rows, hidden_dim), device="cuda", dtype=torch.bfloat16)
     for dst in range(world_size):
@@ -182,6 +182,10 @@ def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 3
     tile_counter = torch.zeros((e_local, world_size), device="cuda", dtype=torch.int32)
     print(f"[rank{rank}] calling custom_a2a e_local={e_local}", flush=True)
     # the layerop
+    # NEW fix with timing stuff
+    dummy_recv_wait = torch.zeros((e_local,), dtype=torch.int64, device="cuda")
+    debug_time = torch.zeros((world_size, e_local, 3), dtype=torch.int64, device="cuda")
+    
     out = custom_a2a(
         tokens,
         dest_counts,
@@ -192,6 +196,8 @@ def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 3
         tb.token_sync,
         #tb.tile_counter,
         tile_counter,
+        debug_time,
+        dummy_recv_wait,
         cb.heap_bases,
         experts,
         cap,
@@ -206,6 +212,7 @@ def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 3
     _spin_wait_counts(cb, world_size)
     _spin_wait_tokens(tb, world_size)
 
+    
     # gather inputs for expected mapping 
     gathered_in = [torch.empty_like(tokens) for _ in range(world_size)]
     dist.all_gather(gathered_in, tokens)
