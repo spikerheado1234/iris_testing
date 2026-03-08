@@ -182,13 +182,13 @@ def check_compare(
     torch.cuda.set_device(rank)
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     
-    # [NEW] 必须显式为当前进程组开启对称内存支持
+    # for testing only
     try:
         import torch.distributed._symmetric_memory as symmem
-        # 这里的 group_name 默认是 "0" 或者从 group 对象获取
+        
         symmem.enable_symm_mem_for_group(dist.group.WORLD.group_name)
     except Exception as e:
-        if rank == 0: print(f"开启 SymmMem 组权限失败: {e}")
+        if rank == 0: print(f" SymmMem failed: {e}")
     
     device = torch.device(f"cuda:{rank}")
 
