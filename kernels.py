@@ -7,7 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-import iris
 
 """
 world = DeviceCount E = E_local = T 
@@ -180,15 +179,14 @@ def counts_exchange_pull(
     ############################################
     ### These two buffers are for READING ONLY. 
     ############################################
-    cnts,  # [world_size, expert_pack] (symmetric memory, addressable by all devices)
-    offsets, # [world_size] (symmetric memory, addressable by all devices)
+    cnts_bases,  # [world_size] (symmetric memory, addressable by all devices) int64
+    offsets_bases,   # [world_size] (symmetric memory, addressable by all devices) int64
     ################################################
     ### These three buffers are for Writing ONLY. 
     ################################################
-    local_expert_cnts, # [world_size, expert_pack] (local memory)
-    local_expert_offset_idxs, # [world_size] (local memory)
-    cnt_exchange_sync, # [1] (unit-sized array in local memory)
-    heap_bases,
+    local_expert_cnts, # [world_size, expert_pack] (local memory) int64
+    local_expert_offset_idxs, # [world_size] (local memory) int64
+    cnt_exchange_sync, # [1] (unit-sized array in local memory)  int32 
     src_rank: tl.constexpr,
     world_size: tl.constexpr,
     e_local: tl.constexpr,
@@ -219,32 +217,26 @@ def counts_exchange_pull(
     """
     dev_id = tl.program_id(0)
 
-    iris.get(
-        cnts + src_rank * e_local + tl.arange(0, BLOCK_M),
-        local_expert_cnts + dev_id * e_local + tl.arange(0, BLOCK_M),
-        from_rank=src_rank,
-        to_rank=dev_id,
-        heap_bases=heap_bases,
-        mask=tl.arange(0, BLOCK_M) < e_local
-    )
+    offs = tl.arange(0, BLOCK_M)
+    mask = offs < e_local
 
-    iris.get(
-        offsets + src_rank,
-        local_expert_offset_idxs + dev_id,
-        from_rank=src_rank,
-        to_rank=dev_id,
-        heap_bases=heap_bases,
-        mask=None
-    )
+    remote_cnts_base_i64 = tl.load(cnts_bases + dev_id)
+    remote_cnts_base = tl.cast(remote_cnts_base_i64, tl.pointer_type(tl.int64))
+    remote_cnts_ptrs = remote_cnts_base + src_rank * e_local + offs
+    vals = tl.load(remote_cnts_ptrs, mask=mask, other=0)
+    tl.store(local_expert_cnts + dev_id * e_local + offs, vals, mask=mask)
 
-    tl.atomic_add(cnt_exchange_sync, 1, sem="release", scope='sys')
+    remote_offsets_base_i64 = tl.load(offsets_bases + dev_id)
+    remote_offsets_base = tl.cast(remote_offsets_base_i64, tl.pointer_type(tl.int64))
+    off_val = tl.load(remote_offsets_base + src_rank)
+    tl.store(local_expert_offset_idxs + dev_id, off_val)
 
-    ## Spin-wait till completion, required for correctness. ##
-    ws = tl.full([], world_size, dtype=tl.int32)
-    v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem='acquire', scope='sys')
-    tl.debug_barrier()
-    while v != ws:
-        v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem='acquire', scope='sys')
+    #tl.atomic_add(cnt_exchange_sync, 1, sem="release", scope="sys")
+
+    #ws = tl.full((), world_size, tl.int32)
+    #v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem="acquire", scope="sys")
+    #while v != ws:
+    #   v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem="acquire", scope="sys")
 
 ## TODO(ahangupta): if this consumes too much runtime, we can migrate this into
 ##                      a triton kernel as well.
@@ -304,22 +296,20 @@ def token_exchange_pull(
     ########################################
     ### These buffers are for READING ONLY. 
     ########################################
-    tokens, # [C, hidden_dim] -> symmetric memory.
-    read_meta, # [world_size, expert_pack] -> local memory.
-    write_meta, # [world_size, expert_pack] -> local memory.
-    local_expert_cnts, # [world_size, expert_pack] -> symmetric memory.
+    tokens_bases,    # [world_size] -> symmetric memory. int64
+    read_meta, # [world_size, expert_pack] -> local memory. int64
+    write_meta, # [world_size, expert_pack] -> local memory. int64
+    local_expert_cnts, # [world_size, expert_pack] -> local memory. int64
     ########################################
     ### These buffers are for WRITING ONLY. 
     ########################################
-    gathered_tokens, # [C', hidden_dim] -> local memory.
-    token_sync, # [world_size, expert_pack] -> local memory.
-    ## Extraneous bits of information.
-    heap_bases,
-    src_rank,
-    world_size,
-    e_local,
+    gathered_tokens, # [T_recv, hidden_dim] -> local memory.
+    token_sync, # [world_size, expert_pack] -> local memory. int32
+    src_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    e_local: tl.constexpr,
     hidden_dim: tl.constexpr,
-    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     """
     This kernel physically exchanges tokens after the metadata exchange stage.
@@ -338,27 +328,25 @@ def token_exchange_pull(
         ##    over-provisioned.
         return 
 
-    read_meta_ptrs = tl.load(read_meta + dev_id * e_local + expert_id) 
-    write_meta_ptrs = tl.load(write_meta + dev_id * e_local + expert_id)
+    read_row = tl.load(read_meta + dev_id * e_local + expert_id) + offset
+    write_row = tl.load(write_meta + dev_id * e_local + expert_id) + offset
 
-    from_ptrs = read_meta_ptrs * hidden_dim + offset * hidden_dim + tl.arange(0, BLOCK_M)
-    to_ptrs = write_meta_ptrs * hidden_dim + offset * hidden_dim + tl.arange(0, BLOCK_M)
+    remote_tokens_base_i64 = tl.load(tokens_bases + dev_id)
+    remote_tokens_base = tl.cast(remote_tokens_base_i64, tl.pointer_type(tl.bfloat16))
 
-    for k in tl.range(tl.cdiv(hidden_dim, BLOCK_M)):
-        iris.get(
-            tokens + from_ptrs,
-            gathered_tokens + to_ptrs,
-            from_rank=src_rank,
-            to_rank=dev_id,
-            heap_bases=heap_bases,
-            mask=tl.arange(0, BLOCK_M)+k*BLOCK_M < hidden_dim
-        )
+    for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
+        k = k0 + tl.arange(0, BLOCK_K)
+        mask = k < hidden_dim
 
-        from_ptrs += BLOCK_M
-        to_ptrs += BLOCK_M
+        src_ptrs = remote_tokens_base + read_row * hidden_dim + k
+        dst_ptrs = gathered_tokens + write_row * hidden_dim + k
 
+        vals = tl.load(src_ptrs, mask=mask, other=0)
+        tl.store(dst_ptrs, vals, mask=mask)
+
+   
     ## Now, we ring a bell to indicate completion. ##
-    tl.atomic_add(token_sync + dev_id * e_local + expert_id, 1, sem='release', scope='sys')
+    #tl.atomic_add(token_sync + dev_id * e_local + expert_id, 1, sem='release', scope='sys')
 
 """
 @triton.jit
