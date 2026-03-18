@@ -1,6 +1,8 @@
 import torch
 import torch.distributed as dist
 import triton
+# from .kernels import counts_exchange_kernel, tokens_exchange_kernel, build_expert_offsets
+
 
 from kernels import counts_exchange_kernel, tokens_exchange_kernel
 from utils import build_expert_offsets, _assert_cuda_int32
@@ -40,11 +42,12 @@ class AllToAllOp(torch.autograd.Function):
                       # Each remote src does atomic_add(+1, release) for each expert after writing token_buf.
         tile_counter, # new with the new kernel
 
-        # Heap bases pointing to symmetric memory arrays of all devices participating in EP.
-        # (Used by iris.put / iris.atomic_add to address peers' symmetric allocations.)
-        heap_bases,   # [world] pointer-like tensor / address list (implementation-dependent)
-
-        # Local variables used.
+        # Replaced heap_bases with specific base pointers
+        pca_bases,           # Base pointers for the 'pca' (count) buffer across all ranks
+        counts_ready_bases,  # Base pointers for the 'counts_ready' signal buffer
+        token_buf_bases,     # Base pointers for the main 'token_buf' (payload) buffer
+        token_sync_bases,    # Base pointers for the 'token_sync' signal buffer
+        # Local variables used
         
         experts,       # total number of experts in the EP group (global)
         capacity,      # CAP: max rows per (dst, expert) stored in token_buf; must match token_buf.shape[2]
@@ -78,8 +81,12 @@ class AllToAllOp(torch.autograd.Function):
         token_sync (Tensor): Stage-2 per-expert completion counters ([E_local]) int32 (symmetric).
             Each remote src atomically increments token_sync[e] by 1 (release) after finishing writes to token_buf[e, src, :, :].
             Any consumer reading token_buf for expert e must wait until token_sync[e] == world_size.
-        heap_bases (Tensor): addresses/bases of devices' symmetric heaps (implementation-dependent).
-            Used by iris.put / iris.atomic_add to address symmetric allocations on remote devices.
+        
+        Native SymMem Pointer Arrays (Replacing the single Heap Base)
+         These tensors contain the physical/virtual base addresses of specific
+         buffers on EVERY rank, enabling direct remote writes via Triton.
+        Shape: [World_Size], Dtype: torch.int64
+        
         experts (int): total number of experts in the EP group (global).
             Must be divisible by world_size; E_local = experts // world_size.
         capacity (int): CAP for token_buf (must match token_buf.shape[2]).
@@ -102,7 +109,8 @@ class AllToAllOp(torch.autograd.Function):
             dest_counts,     # send_counts_ptr
             local_pca,       # pca_ptr on destination
             counts_ready,    # counts_ready_ptr on destination
-            heap_bases,
+            pca_bases,           # New: Pass the base pointers
+            counts_ready_bases,  # New
             src_rank=rank,
             world_size=world_size,
             e_local=e_local,
@@ -112,11 +120,15 @@ class AllToAllOp(torch.autograd.Function):
         
      
        # Stage-2: token exchange (per-token blocks)
-          
+       # new tile params
+        TILE_SIZE = 64
+        MAX_TILES = (capacity + TILE_SIZE - 1) // TILE_SIZE
+
         tokens_exchange_kernel[(world_size, e_local, capacity)](
         tokens, dest_counts, dst_offsets, expert_offs,
         token_buf, token_sync, tile_counter,
-        heap_bases,
+        token_buf_bases,     # New: Pass the base pointers
+        token_sync_bases,    # New
         src_rank=rank,
         world_size=world_size,
         e_local=e_local,
@@ -124,6 +136,9 @@ class AllToAllOp(torch.autograd.Function):
         hidden_dim=hidden_dim,
         BLOCK_K=block_k,
         num_warps=token_num_warps,
+        # new params
+        TILE_SIZE=TILE_SIZE,
+        MAX_TILES=MAX_TILES,
     )
         #return only the layer output (token_buf).
         return token_buf
