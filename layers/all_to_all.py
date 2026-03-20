@@ -124,7 +124,7 @@ class AllToAllOp(torch.autograd.Function):
         TILE_SIZE = 64
         MAX_TILES = (capacity + TILE_SIZE - 1) // TILE_SIZE
 
-        tokens_exchange_kernel[(world_size, e_local, capacity)](
+        tokens_exchange_kernel[(world_size, e_local, MAX_TILES)](
         tokens, dest_counts, dst_offsets, expert_offs,
         token_buf, token_sync, tile_counter,
         token_buf_bases,     # New: Pass the base pointers
