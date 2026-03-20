@@ -84,7 +84,7 @@ def tokens_exchange_kernel(
 
     dst    = tl.program_id(0)
     expert = tl.program_id(1)
-    tid    = tl.program_id(2)
+    tile_id = tl.program_id(2) # RECV tile_id now
 
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
     n_eff = tl.minimum(n, tl.full((), CAP, tl.int32))
@@ -98,58 +98,38 @@ def tokens_exchange_kernel(
             tl.atomic_add(remote_sync_base + remote_sync_offset, 1, sem="release")
             return
 
-    if tid >= n_eff:
+    tile_start_tid = tile_id * TILE_SIZE
+    if tile_start_tid >= n_eff:
         return
+
+    tokens_in_this_tile = tl.minimum(TILE_SIZE, n_eff - tile_start_tid)
 
     dst_base  = tl.load(dst_offsets_ptr + dst).to(tl.int32)
     e_off     = tl.load(expert_offs_ptr + dst * e_local + expert).to(tl.int32)
-    send_row  = dst_base + e_off + tid
+    remote_token_base = tl.load(token_buf_bases_ptr + dst).to(tl.pointer_type(tl.bfloat16))
 
-    # Calculate Remote Offset (relative to Token Buffer start)
-    # Layout: [E, W, CAP, H]
-    # Formula: expert * (W*CAP*H) + src_rank * (CAP*H) + tid * H
-    # Cast to int64 to prevent overflow
-    row_offset = (expert.to(tl.int64) * world_size + src_rank) * CAP * hidden_dim + tid * hidden_dim
-    
-    # Load remote base address
-    remote_token_base = tl.load(token_buf_bases_ptr + dst).to(tl.pointer_type(tl.bfloat16)) # Assuming bf16
+    # 64 tokens in a row
 
-    for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
-        offs_k = k0 + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < hidden_dim
-
-        # Load Local Data
-        vals = tl.load(send_ptr + send_row * hidden_dim + offs_k, mask=k_mask)
+    for offset in range(TILE_SIZE):
+        if offset >= tokens_in_this_tile:
+            break
+            
+        tid = tile_start_tid + offset
+        send_row = dst_base + e_off + tid
+        row_offset = (expert.to(tl.int64) * world_size + src_rank) * CAP * hidden_dim + tid * hidden_dim
         
-        # Store to Remote
-        remote_ptr = remote_token_base + row_offset + offs_k
-        tl.store(remote_ptr, vals, mask=k_mask)
+        for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < hidden_dim
+            vals = tl.load(send_ptr + send_row * hidden_dim + offs_k, mask=k_mask)
+            remote_ptr = remote_token_base + row_offset + offs_k
+            tl.store(remote_ptr, vals, mask=k_mask)
 
-    # calc where tile belong
-    tile_id = tid // TILE_SIZE
+    tl.debug_barrier()
 
-    # calc the actual token number inside
-    tile_start_tid = tile_id * TILE_SIZE
-    tokens_in_this_tile = tl.minimum(TILE_SIZE, n_eff - tile_start_tid)
-
-    # find the local conuter of the tile
-    ctr_offset = (expert * world_size * MAX_TILES) + (dst * MAX_TILES) + tile_id
-    ctr_ptr = tile_counter_ptr + ctr_offset
-  
-    # incremnt counter inside
-    old_val = tl.atomic_add(ctr_ptr, 1, sem="release")
-
-    if old_val == tokens_in_this_tile - 1:
-        
-        # this one is optional,make sure all the store from the block are visible
-        tl.debug_barrier() 
-
-        remote_sync_base = tl.load(token_sync_bases_ptr + dst).to(tl.pointer_type(tl.int32))
-        
-        # to：expert，sender src_rank，which tile_id 
-        remote_sync_offset = (expert * world_size * MAX_TILES) + (src_rank * MAX_TILES) + tile_id
-        
-        tl.atomic_add(remote_sync_base + remote_sync_offset, 1, sem="release")
+    remote_sync_base = tl.load(token_sync_bases_ptr + dst).to(tl.pointer_type(tl.int32))
+    remote_sync_offset = (expert * world_size * MAX_TILES) + (src_rank * MAX_TILES) + tile_id
+    tl.atomic_add(remote_sync_base + remote_sync_offset, 1, sem="release")
 """
 @triton.jit
 def token_shuffle(
