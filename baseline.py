@@ -1,3 +1,7 @@
+"""
+New version includes the padding path for more fair comparison
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,6 +9,7 @@ from typing import Optional, Tuple, Dict
 
 import torch
 import torch.distributed as dist
+
 
 # Utilities
 def _assert_cuda(x: torch.Tensor, name: str):
@@ -40,7 +45,7 @@ class BaselineBuffers:
     # Optional "final layout" buffer for correctness checks
     token_buf: Optional[torch.Tensor]    # [e_local, world_size, capacity, hidden_dim] or None
 
-
+## allowed forced max cap
 def init_baseline_buffers(
     world_size: int,
     e_local: int,
@@ -50,6 +55,7 @@ def init_baseline_buffers(
     device: torch.device,
     total_recv: int,
     allocate_token_buf: bool = False,
+    force_max_capacity: bool = False
 ) -> BaselineBuffers:
     """
     Allocate persistent buffers once, outside the timing loop.
@@ -59,7 +65,12 @@ def init_baseline_buffers(
     recv_counts_flat = torch.empty((world_size * e_local,), device=device, dtype=torch.int32)
     out_splits = torch.empty((world_size,), device=device, dtype=torch.int32)
 
-    recv_payload_flat = torch.empty((total_recv, hidden_dim), device=device, dtype=token_dtype)
+    if force_max_capacity:
+        actual_size = world_size * e_local * capacity
+    else:
+        actual_size = total_recv
+
+    recv_payload_flat = torch.empty((actual_size, hidden_dim), device=device, dtype=token_dtype)
 
     token_buf = None
     if allocate_token_buf:
@@ -118,6 +129,7 @@ def exchange_counts_a2a(
 
 
 # Step-2 token exchange (reference)
+## a2a part
 def exchange_payload_a2a(
     send_payload: torch.Tensor,
     send_counts: torch.Tensor,
@@ -172,6 +184,36 @@ def exchange_payload_a2a(
 
     return buffers.recv_payload_flat, in_splits, out_splits
 
+## padding path
+def exchange_payload_padding(
+    send_payload: torch.Tensor, # payload here can be fake with a right shape
+    buffers: BaselineBuffers,
+    capacity: int,
+    world_size: int,
+    e_local: int,
+    hidden_dim: int,
+) -> torch.Tensor:
+    """
+    Simulates the naive padding-based communication (Senior's design).
+    Transmits fixed size = Capacity * E_Local for every rank.
+    """
+    # calculating the fixed chunk size
+    # fixed_size_bytes = capacity * e_local * hidden_dim * sizeof(dtype)
+    # split size means row in pytorch all2all single
+    split_rows = capacity * e_local
+    
+    # construct fixed padding logic
+    split_list = [split_rows] * world_size
+    
+    # direct communication
+    dist.all_to_all_single(
+        buffers.recv_payload_flat,      # Recv buffer (Max Padded Size)
+        buffers.recv_payload_flat,      # Send buffer (Hack: Reuse recv buffer as dummy source)
+        output_split_sizes=split_list,
+        input_split_sizes=split_list,
+    )
+
+    return buffers.recv_payload_flat
 
 
 # Optional reorder for correctness 
@@ -224,7 +266,8 @@ def reorder_flat_to_token_buf(
 
 
 # One-call runner (timed segments)
-def run_baseline_ref(
+
+def run_baseline_a2a(
     rank: int,
     world_size: int,
     e_local: int,
@@ -303,3 +346,54 @@ def run_baseline_ref(
         t["reorder_ms"] = 0.0
 
     return token_buf, t, meta
+
+# NEW Runner for the padding path
+def run_baseline_padding(
+    rank: int,
+    world_size: int,
+    e_local: int,
+    capacity: int,
+    hidden_dim: int,
+    send_counts: torch.Tensor,
+    buffers: BaselineBuffers,
+    profile: bool = False,         # keep interface consistent
+    barrier: bool = True,
+) -> Dict[str, float]:
+    """
+    Executes the padding-based baseline (Senior's simulation).
+    """
+    t: Dict[str, float] = {}
+    
+    # Step 1: Counts Exchange 
+    # mimic reality
+    if barrier:
+        dist.barrier()
+    torch.cuda.synchronize()
+
+    s1, e1 = _cuda_event_timer()
+    s1.record()
+    exchange_counts_a2a(send_counts, buffers, strict_capacity=False, capacity=capacity)
+    e1.record()
+    t["step1_ms"] = _elapsed_ms(s1, e1)
+
+    # Step 2: Padding Payload Exchange
+    if barrier:
+        dist.barrier()
+    torch.cuda.synchronize()
+
+    s2, e2 = _cuda_event_timer()
+    s2.record()
+    
+    exchange_payload_padding(
+        send_payload=None, # reuse buffer not real
+        buffers=buffers,
+        capacity=capacity,
+        world_size=world_size,
+        e_local=e_local,
+        hidden_dim=hidden_dim
+    )
+    
+    e2.record()
+    t["step2_ms"] = _elapsed_ms(s2, e2)
+
+    return t
