@@ -1,25 +1,278 @@
 from __future__ import annotations
-import math
 import random
 from typing import Tuple, List
-
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
-
+import os
 from dataclasses import dataclass
+import time
+# in case some error of naming so I think the predicton here is necessary
+try:
+    import torch.distributed._symmetric_memory as symmem
+    HAS_SYMMEM = True
+except ImportError:
+    symmem = None
+    HAS_SYMMEM = False
+
+import torch.nn.functional as F
+
+########################
+# SymmMem-backed buffers
+########################
+
+@dataclass
+class ShmemBuffers:
+    # Tensor objects (kept to prevent garbage collection)
+    pca: torch.Tensor
+    counts_ready: torch.Tensor
+    token_buf: torch.Tensor
+    token_sync: torch.Tensor
+    tile_counter: torch.Tensor
+    
+    # Tensor containing base pointers for all ranks (passed to Triton kernels)
+    pca_bases: torch.Tensor
+    counts_ready_bases: torch.Tensor
+    token_buf_bases: torch.Tensor
+    token_sync_bases: torch.Tensor
+
+    # new hanler based shmempart for pytorch 
+    pca_hdl: object
+    counts_ready_hdl: object
+    token_buf_hdl: object
+    token_sync_hdl: object
+
+def _device_for_rank(rank: int) -> torch.device:
+    return torch.device(f"cuda:{rank}")
 
 
-def nvtx_push(msg):
+def _as_cuda_i64_ptr_tensor(ptrs, device: torch.device) -> torch.Tensor:
+    return torch.tensor(list(ptrs), dtype=torch.int64, device=device)
+
+### get_buffer_ptrs and alloc symmetric will no longer be utilized due to pytorch difference from iris
+
+# new alloc with pytorch symmmem
+def _alloc_and_rdzv(
+        shape, 
+        dtype: torch.dtype, 
+        device: torch.device
+):
+    """
+    Allocate a symmetric tensor and immediately rendezvous it.
+
+    Returns:
+        tensor, handle, base_ptrs_tensor[int64 on CUDA]
+    """
+    # only for testing
+    if not HAS_SYMMEM:
+        raise RuntimeError("PyTorch SymmMem is required but not available")
+
+    t = symmem.empty(shape, dtype=dtype, device=device)
+    hdl = symmem.rendezvous(t, group=dist.group.WORLD)
+
+    # PyTorch SymmMem exposes peer base pointers via the handle.
+    bases = _as_cuda_i64_ptr_tensor(hdl.buffer_ptrs, device)
+    return t, hdl, bases
+
+
+# updated shmem buufer alloc with handle support of pytorch ver
+def alloc_shmem_buffers(
+    world_size: int,
+    e_local: int,
+    capacity: int,
+    hidden_dim: int,
+    token_dtype: torch.dtype,
+) -> ShmemBuffers:
+    rank = dist.get_rank()
+    device = torch.device(f"cuda:{rank}")
+    """
+    Allocate all buffers needed by custom_a2a.
+
+    Layouts must stay compatible with all_to_all.py / kernels.py:
+      pca          : [e_local, world_size]         int32
+      counts_ready : [1]                           int32
+      token_buf    : [e_local, world_size, cap, H] token_dtype
+      token_sync   : [e_local]                     int32
+      tile_counter : [e_local, world_size]         int32   (local scratch only)
+    """
+    rank = dist.get_rank()
+    device = _device_for_rank(rank)
+
+    # new const for tile logic
+    TILE_SIZE = 64
+    MAX_TILES = (capacity + TILE_SIZE - 1) // TILE_SIZE
+    
+    # SymmMem tensors + handles + peer base pointers
+    pca, pca_hdl, pca_bases = _alloc_and_rdzv(
+        (e_local, world_size), torch.int32, device
+    )
+    counts_ready, counts_ready_hdl, counts_ready_bases = _alloc_and_rdzv(
+        (1,), torch.int32, device
+    )
+    token_buf, token_buf_hdl, token_buf_bases = _alloc_and_rdzv(
+        (e_local, world_size, capacity, hidden_dim), token_dtype, device
+    )
+    token_sync, token_sync_hdl, token_sync_bases = _alloc_and_rdzv(
+        (e_local, world_size, MAX_TILES), torch.int32, device
+    ) #3D matrix now
+
+    # local-only scratch 3dnow
+    tile_counter = torch.zeros((e_local, world_size, MAX_TILES), dtype=torch.int32, device=device)
+
+    print(f"[rank{rank}] pca_bases={pca_bases.tolist()}", flush=True)
+    print(f"[rank{rank}] counts_ready_bases={counts_ready_bases.tolist()}", flush=True)
+    print(f"[rank{rank}] token_buf_bases={token_buf_bases.tolist()}", flush=True)
+    print(f"[rank{rank}] token_sync_bases={token_sync_bases.tolist()}", flush=True)
+
+    return ShmemBuffers(
+        pca=pca, 
+        counts_ready=counts_ready, 
+        token_buf=token_buf,
+        token_sync=token_sync, 
+        tile_counter=tile_counter,
+        pca_bases=pca_bases, 
+        counts_ready_bases=counts_ready_bases,
+        token_buf_bases=token_buf_bases, 
+        token_sync_bases=token_sync_bases,
+        pca_hdl=pca_hdl, 
+        counts_ready_hdl=counts_ready_hdl,
+        token_buf_hdl=token_buf_hdl, 
+        token_sync_hdl=token_sync_hdl,
+    )
+
+
+def reset_custom_iter_state(buffers, clear_token_buf: bool = False) -> None:
+    
+    """
+    Per-iteration reset for custom path.
+
+    For correctness/debugging, clear everything that may contain stale state.
+    For pure perf runs, you can decide whether to skip some zeroing.
+    """
+    buffers.pca.zero_()
+    buffers.counts_ready.zero_()
+    buffers.token_sync.zero_()
+    buffers.tile_counter.zero_()
+    if clear_token_buf:
+        buffers.token_buf.zero_()
+################
+# Small helpers
+###############
+def wait_counts_ready(
+    counts_ready: torch.Tensor,
+    world_size: int,
+    *,
+    sleep_us: int = 0,
+    max_spins: int = 1_000_000,
+) -> None:
+    """
+    Host-side completion wait for Stage-1 counts exchange.
+
+    Fast path (experimental):
+      use torch.cuda._busy_wait_for_flag if available and enabled.
+
+    Fallback:
+      Python .item() polling.
+    """
+    assert counts_ready.is_cuda, "counts_ready must be CUDA"
+    assert counts_ready.dtype == torch.int32, "counts_ready must be int32"
+
+    target = int(world_size)
+
+    # ---- experimental fast path ----
+    # proven  to be useless. maybe future
+    #use_busy_wait = os.getenv("USE_CUDA_BUSY_WAIT", "0") == "1"
+    #if use_busy_wait and hasattr(torch.cuda, "_busy_wait_for_flag"):
+        #try:
+            # try the most likely calling convention
+            #torch.cuda._busy_wait_for_flag(counts_ready, target)
+            #print("Success")
+            #return
+        #except TypeError:
+            # signature mismatch on this build -> fall back
+            #pass
+        #except Exception:
+            # any runtime issue -> fall back safely
+            #pass
+
+    # ---- safe fallback ----
+    spins = 0
+    while True:
+        cur = int(counts_ready.item())
+        if cur >= target:
+            return
+
+        spins += 1
+        if spins >= max_spins:
+            raise RuntimeError(
+                f"wait_counts_ready timeout: expected >= {target}, observed {cur}"
+            )
+
+        if sleep_us > 0:
+            time.sleep(sleep_us * 1e-6)
+    
+
+def wait_token_sync_ready(
+    token_sync: torch.Tensor,
+    pca: torch.Tensor,
+    *,
+    tile_size: int = 64,
+    sleep_us: int = 0,
+    max_spins: int = 1_000_000,
+) -> None:
+    """
+    token_sync: [E_local, world_size, MAX_TILES] int32
+    pca:        [E_local, world_size] int32
+    Wait until all actually-needed tiles are ready.
+    """
+    assert token_sync.is_cuda
+    assert token_sync.dtype == torch.int32
+    assert token_sync.dim() == 3
+
+    assert pca.is_cuda
+    assert pca.dtype == torch.int32
+    assert pca.shape == token_sync.shape[:2]
+
+    spins = 0
+    while True:
+        counts = pca.to(torch.int32)
+        need_tiles = torch.clamp((counts + tile_size - 1) // tile_size, min=1)  # [E, W]
+        tile_ids = torch.arange(token_sync.shape[2], device=token_sync.device, dtype=torch.int32)
+        needed_mask = tile_ids.view(1, 1, -1) < need_tiles.unsqueeze(-1)         # [E, W, T]
+
+        ready = bool(torch.all(token_sync[needed_mask] >= 1).item())
+        if ready:
+            return
+
+        spins += 1
+        if spins >= max_spins:
+            observed = token_sync[needed_mask]
+            cur_min = int(observed.min().item()) if observed.numel() > 0 else 0
+            cur_max = int(observed.max().item()) if observed.numel() > 0 else 0
+            raise RuntimeError(
+                f"wait_token_sync_ready timeout: needed tiles not all ready, "
+                f"observed min={cur_min}, max={cur_max}"
+            )
+
+        if sleep_us > 0:
+            time.sleep(sleep_us * 1e-6)
+            
+def nvtx_push(msg: str) -> None:
     torch.cuda.nvtx.range_push(msg)
 
-def nvtx_pop():
+def nvtx_pop() -> None:
     torch.cuda.nvtx.range_pop()
+
 
 # judging and checking cap
 def _allreduce_max_i32(x: torch.Tensor) -> torch.Tensor:
     y = x.clone()
     dist.all_reduce(y, op=dist.ReduceOp.MAX)
+    return y
+
+
+def _allreduce_min_i32(x: torch.Tensor) -> torch.Tensor:
+    y = x.clone()
+    dist.all_reduce(y, op=dist.ReduceOp.MIN)
     return y
 
 
@@ -29,24 +282,34 @@ def _sync_and_check(ok_flag: torch.Tensor) -> int:
         dist.barrier()
     return ok_global
 
-def _allreduce_min_i32(x: torch.Tensor) -> torch.Tensor:
-    y = x.clone()
-    dist.all_reduce(y, op=dist.ReduceOp.MIN)
-    return y
 
 def _assert_cuda_int32(x: torch.Tensor, name: str) -> None:
-    
     assert x.is_cuda, f"{name} must be CUDA"
     assert x.dtype == torch.int32, f"{name} must be int32"
 
 
 
 def _build_dst_offsets(send_counts: torch.Tensor) -> torch.Tensor:
-    """dst_offsets[dst] = prefix sum of total tokens to earlier destinations."""
-    # send_counts: [world, E_local] int32
+    """
+    dst_offsets[dst] = prefix sum of total tokens to earlier destinations.
+    send_counts: [world, e_local] int32
+    """
     send_dst_sizes = send_counts.sum(dim=1).to(torch.int32)
     dst_offsets = (torch.cumsum(send_dst_sizes, dim=0) - send_dst_sizes).to(torch.int32)
     return dst_offsets.contiguous()
+
+def build_expert_offsets(send_counts: torch.Tensor) -> torch.Tensor:
+    """
+    Prefix offsets within each destination block in send_payload.
+
+    send_counts: [world, E_local] int32
+    returns: expert_offs[dst, e]
+    """
+    _assert_cuda_int32(send_counts, "send_counts")
+    sc64 = send_counts.to(torch.int64)
+    offs = (torch.cumsum(sc64, dim=1) - sc64).to(torch.int32)
+    return offs.contiguous()
+
 
 
 def _masked_stats(
@@ -78,116 +341,17 @@ def _masked_stats(
 
     return max_diff, sum_custom, sum_base
 
-# Step-1/2 run wrapper
-def build_expert_offsets(send_counts: torch.Tensor) -> torch.Tensor:
-    """
-    Prefix offsets within each destination block in send_payload.
-
-    send_counts: [world, E] int32
-    returns: expert_offs[dst, e] (row offset within the dst block).
-    """
-
-    _assert_cuda_int32(send_counts, "send_counts")
-    sc64 = send_counts.to(torch.int64)
-    offs = (torch.cumsum(sc64, dim=1) - sc64).to(torch.int32)
-    return offs.contiguous()
-
-
-@dataclass
-class ShmemBuffers:
-    # Step-1 outputs / sync
-    pca: torch.Tensor          # [E, world] int32 (symmetric)
-    counts_ready: torch.Tensor # [1] int32 (symmetric)
-
-    # Step-2 outputs / sync
-    token_buf: torch.Tensor     # [E, world, CAP, H] (symmetric)
-    token_sync: torch.Tensor    # [E] int32 (symmetric)
-    tile_counter: torch.Tensor  # [E, world] int32 (symmetric)  <-- NEW
-
-    # Cached heap bases
-    heap_bases: torch.Tensor
-
-
-    
-
-def alloc_shmem_buffers(
-    shmem,
-    world_size: int,
-    e_local: int,
-    capacity: int,
-    hidden_dim: int,
-    token_dtype: torch.dtype,
-) -> ShmemBuffers:# new shmem buffers
-    # Step-1
-    pca = shmem.zeros((e_local, world_size), dtype=torch.int32, device="cuda")
-    counts_ready = shmem.zeros((1,), dtype=torch.int32, device="cuda")
-
-    # Step-2
-    token_buf = shmem.zeros((e_local, world_size, capacity, hidden_dim), dtype=token_dtype, device="cuda")
-    token_sync = shmem.zeros((e_local,), dtype=torch.int32, device="cuda")
-
-    # NEW: per-(expert,src) tile counter on dst
-    tile_counter = shmem.zeros((e_local, world_size), dtype=torch.int32, device="cuda")
-
-    heap_bases = shmem.get_heap_bases()
-    return ShmemBuffers(
-        pca=pca,
-        counts_ready=counts_ready,
-        token_buf=token_buf,
-        token_sync=token_sync,
-        tile_counter=tile_counter,   # <-- NEW
-        heap_bases=heap_bases,
-    )
-
-
-
-@dataclass
-class CountsBuffers:
-    pca: torch.Tensor
-    counts_ready: torch.Tensor
-    heap_bases: torch.Tensor
-
-def reset_counts_sync(cb: CountsBuffers) -> None:
-    cb.counts_ready.zero_()
-
-def reset_token_sync(tb: TokenBuffers) -> None:
-    tb.token_sync.zero_()
-
-def reset_token_buf_debug(tb: TokenBuffers) -> None:
-    tb.token_buf.zero_()
-
-@dataclass
-class TokenBuffers:
-    token_buf: torch.Tensor
-    token_sync: torch.Tensor
-    tile_counter: torch.Tensor  # <-- NEW
-
-
-def alloc_counts_buffers(shmem, world_size: int, e_local: int) -> CountsBuffers:
-    pca = shmem.zeros((e_local, world_size), dtype=torch.int32, device="cuda")
-    counts_ready = shmem.zeros((1,), dtype=torch.int32, device="cuda")
-    heap_bases = shmem.get_heap_bases()
-    return CountsBuffers(pca=pca, counts_ready=counts_ready, heap_bases=heap_bases)
-
-def alloc_token_buffers(
-    shmem,
-    world_size: int,
-    e_local: int,
-    capacity: int,
-    hidden_dim: int,
-    token_dtype: torch.dtype,
-) -> TokenBuffers:
-    token_buf = shmem.zeros((e_local, world_size, capacity, hidden_dim), dtype=token_dtype, device="cuda")
-    token_sync = shmem.zeros((e_local,), dtype=torch.int32, device="cuda")
-    tile_counter = shmem.zeros((e_local, world_size), dtype=torch.int32, device="cuda")  # <-- NEW
-    return TokenBuffers(token_buf=token_buf, token_sync=token_sync, tile_counter=tile_counter)
-
 def compute_capacity_from_pca(pca: torch.Tensor) -> int:
     cap = pca.max().to(torch.int32)
     dist.all_reduce(cap, op=dist.ReduceOp.MAX)
     return max(int(cap.item()), 1)
 
 
+
+
+############################
+# Data generation / routing
+############################
 
 def set_seed(base_seed: int, rank: int) -> None:
     #Use different seeds per-rank for token generation / routing decisions.
@@ -276,9 +440,8 @@ def route_and_pack_padding_free(
 
     # Stable append order: increasing token index, then increasing top-k slot
     
-    t = tokens
-    for ti in range(t.shape[0]):
-        tok = t[ti]
+    for ti in range(tokens.shape[0]):
+        tok = tokens[ti]
         for kk in range(topk):
             ex = int(top_idxs[ti, kk].item())
             dst = ex // e_local
