@@ -1,84 +1,56 @@
-import torch
-import torch.distributed as dist
-
 import os
 import time
-import iris
+import argparse
+import random
+
+import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.distributed._symmetric_memory as symmem
+
 from layers.all_to_all import custom_a2a
-from layers.all_to_all_gather import gather_a2a
-# 4debug
-from layers.all_to_all import _LAST_DBG
-
-#from .layers.token_shuffle import shuffle
-#from .layers.expert import expert
-
-from utils import alloc_counts_buffers, alloc_token_buffers, _build_dst_offsets
-from baseline import exchange_counts_a2a, exchange_payload_a2a, init_baseline_buffers
-
-# 4 debug only
-import time
-def _spin_wait_counts(cb, world_size, timeout_s=10.0):
-    t0 = time.time()
-    while True:
-        v = int(cb.counts_ready.item())
-        if v >= world_size:
-            return
-        if time.time() - t0 > timeout_s:
-           # print what has not written
-            pca = cb.pca.detach().cpu().to(torch.int32)  # [E, world]
-            col_sums = pca.sum(dim=0).tolist()
-            raise RuntimeError(
-                f"timeout waiting counts_ready: {v} < {world_size}, "
-                f"pca_col_sums={col_sums}"
-            )
-        time.sleep(0.001)
-
-def _spin_wait_tokens(tb, world_size, dbg=None, timeout_s=10.0):
-    t0 = time.time()
-    while True:
-        ok = bool(torch.all(tb.token_sync == world_size).item())
-        if ok:
-            return
-        if time.time() - t0 > timeout_s:
-            msg = f"timeout token_sync: {tb.token_sync.tolist()}"
-            if dbg is not None:
-                stage, hb, last = dbg
-                msg += (
-                    f"\nstage=\n{stage.detach().cpu()}\n"
-                    f"hb=\n{hb.detach().cpu()}\n"
-                    f"last=\n{last.detach().cpu()}\n"
-                )
-            if _LAST_DBG:
-                print("stage:\n", _LAST_DBG["stage"].cpu())
-                print("hb:\n",    _LAST_DBG["hb"].cpu())
-                print("last:\n",  _LAST_DBG["last"].cpu())
-            raise RuntimeError(msg)
-        time.sleep(0.001)
+from layers.token_shuffle import shuffle
+from layers.expert import expert
+from utils import alloc_shmem_buffers, set_seed
 
 
+# =========================================================
+# Part 0. Common helpers
+# =========================================================
+
+def _require_cuda():
+    assert torch.cuda.is_available(), "CUDA/HIP device is required."
 
 
+def _device():
+    return torch.device("cuda")
 
-## Some simple testing utility functions.
 
-# this two important for IPv6 / hostname  / TCPStore connect errors also some subtle triton errors like cache overwrites of ranks
-def _init_dist_tcp(rank: int, world_size: int) -> None:
-    # 1) Per-process Triton cache (avoid multi-proc cache races)
+def _dtype():
+    # keep consistent with your main benchmark
+    return torch.bfloat16
+
+
+def _rand_seed(seed: int = 42):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _init_dist_tcp(rank: int, world_size: int, master_port: str = "29500") -> None:
+    # Per-process Triton cache, avoids multi-proc cache races
     cache_dir = f"/tmp/triton_cache_{os.getuid()}_{os.getpid()}_rank{rank}"
     os.environ["TRITON_CACHE_DIR"] = cache_dir
     os.makedirs(cache_dir, exist_ok=True)
 
-    # 2) Local rendezvous (avoid hostname/IPv6 resolution issues)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "29500")
+    os.environ["MASTER_PORT"] = master_port
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
 
-    # 3) Ensure rank->GPU mapping is explicit
     torch.cuda.set_device(rank)
 
-    # 4) Init PG with explicit device_id to avoid "Guessing device ID" warnings/hangs
     dist.init_process_group(
         backend="nccl",
         init_method="env://",
@@ -87,71 +59,316 @@ def _init_dist_tcp(rank: int, world_size: int) -> None:
         device_id=torch.device(f"cuda:{rank}"),
     )
 
-def _worker(local_rank: int, world_size: int) -> None:
-    _init_dist_tcp(local_rank, world_size)
-    shmem = _get_shmem()  # init once per process
-    print(f"[rank{local_rank}] init ok, cuda={torch.cuda.current_device()}", flush=True)
+
+def _destroy_dist():
     try:
-        # run tests ONLY inside workers
-        print(f"[rank{local_rank}] begin test e_local=2", flush=True)
-        test_custom_a2a(shmem, e_local=2, hidden_dim=128, cap=32)
-        print(f"[rank{local_rank}] done  test e_local=2", flush=True)
-
-        print(f"[rank{local_rank}] begin test e_local=4", flush=True)
-        test_custom_a2a(shmem, e_local=4, hidden_dim=256, cap=16)
-        print(f"[rank{local_rank}] done  test e_local=4", flush=True)
-
-        if local_rank == 0:
-            print("custom_a2a tests PASSED")
-    finally:
+        dist.barrier()
+    except Exception:
+        pass
+    try:
         dist.destroy_process_group()
+    except Exception:
+        pass
 
-def is_correct(one, two, threshold):
-    if one.shape != two.shape:
-        return abs(one.sum() - two.sum()) < threshold
 
-    return torch.allclose(one, two, rtol=threshold)
+def _spin_wait_counts(buffers, world_size, timeout_s=10.0):
+    t0 = time.time()
+    while True:
+        v = int(buffers.counts_ready.item())
+        if v >= world_size:
+            return
+        if time.time() - t0 > timeout_s:
+            raise RuntimeError(f"timeout waiting counts_ready: {v} < {world_size}")
+        time.sleep(0.001)
+
+
+def _spin_wait_token_sync(buffers, cap: int, world_size: int, tile_size: int = 64, timeout_s: float = 10.0):
+    """
+    Robust wait helper that tolerates different token_sync layouts.
+
+    Old semantics:
+      - token_sync is 1D or 2D and may accumulate to world_size
+
+    New semantics:
+      - token_sync is 3D [E_local, world_size, MAX_TILES]
+      - each used tile is expected to become 1
+    """
+    t0 = time.time()
+    need_tiles = max((cap + tile_size - 1) // tile_size, 1)
+
+    while True:
+        v = buffers.token_sync.detach().cpu()
+
+        ok = False
+        if v.dim() == 1:
+            ok = bool((v.to(torch.int32) >= world_size).all())
+        elif v.dim() == 2:
+            # conservative fallback
+            ok = bool((v.to(torch.int32) >= 1).all())
+        elif v.dim() == 3:
+            used = v[:, :, :need_tiles].to(torch.int32)
+            ok = bool((used >= 1).all())
+        else:
+            raise RuntimeError(f"Unexpected token_sync dim={v.dim()} shape={tuple(v.shape)}")
+
+        if ok:
+            return
+
+        if time.time() - t0 > timeout_s:
+            raise RuntimeError(f"timeout waiting token_sync, shape={tuple(v.shape)}")
+        time.sleep(0.001)
+
 
 def _require_dist():
-    assert dist.is_initialized(), (
-        "torch.distributed is not initialized. "
-        "Run with torchrun/srun so process group is initialized before running unit tests."
+    assert dist.is_initialized(), "torch.distributed must be initialized."
+    assert dist.get_world_size() > 1, "Need WORLD_SIZE > 1."
+    assert torch.cuda.is_available(), "CUDA/HIP required."
+
+
+def _all_gather_tensors(x: torch.Tensor):
+    gathered = [torch.empty_like(x) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, x)
+    return gathered
+
+
+def _make_expert_offsets(local_expert_cnt: torch.Tensor) -> torch.Tensor:
+    offsets = torch.zeros_like(local_expert_cnt, dtype=torch.int32, device=local_expert_cnt.device)
+    if local_expert_cnt.numel() > 1:
+        offsets[1:] = local_expert_cnt.cumsum(dim=0)[:-1].to(torch.int32)
+    return offsets
+
+
+def ref_expert(tokens: torch.Tensor, weights: torch.Tensor, local_expert_cnt: torch.Tensor) -> torch.Tensor:
+    if tokens.numel() == 0:
+        return torch.empty((0, weights.size(-1)), dtype=torch.float32, device="cpu")
+
+    tokens_cpu = tokens.float().cpu()
+    weights_cpu = weights.float().cpu()
+    cnt_cpu = local_expert_cnt.cpu()
+
+    out_chunks = []
+    offset = 0
+    for i in range(weights_cpu.size(0)):
+        cnt = int(cnt_cpu[i].item())
+        if cnt > 0:
+            out_chunks.append(torch.matmul(tokens_cpu[offset:offset + cnt], weights_cpu[i]))
+            offset += cnt
+
+    if len(out_chunks) == 0:
+        return torch.empty((0, weights.size(-1)), dtype=torch.float32, device="cpu")
+
+    return torch.cat(out_chunks, dim=0).float()
+
+
+# =========================================================
+# Part 1. Single-GPU GEMM correctness tests
+# =========================================================
+
+def gen_gemm_input(num_local_experts, token_hid_dim, expert_hid_dim, counts=None, seed=42):
+    _require_cuda()
+    _rand_seed(seed)
+
+    device = _device()
+    dtype = _dtype()
+
+    if counts is None:
+        expert_token_cnt = torch.randint(
+            low=0, high=33,
+            size=(num_local_experts,),
+            device=device,
+            dtype=torch.int32,
+        )
+    else:
+        expert_token_cnt = torch.tensor(counts, device=device, dtype=torch.int32)
+        assert expert_token_cnt.numel() == num_local_experts
+
+    total_tokens = int(expert_token_cnt.sum().item())
+    tokens = torch.randn((total_tokens, token_hid_dim), device=device, dtype=dtype)
+    weights = torch.randn((num_local_experts, token_hid_dim, expert_hid_dim), device=device, dtype=dtype)
+    return tokens, weights, expert_token_cnt
+
+
+def run_one_gemm_case(num_local_experts, token_hid_dim, expert_hid_dim, counts=None, seed=42, atol=2e-2, rtol=2e-2):
+    tokens, weights, local_expert_cnt = gen_gemm_input(
+        num_local_experts=num_local_experts,
+        token_hid_dim=token_hid_dim,
+        expert_hid_dim=expert_hid_dim,
+        counts=counts,
+        seed=seed,
     )
-    assert dist.get_world_size() > 1, "Need WORLD_SIZE > 1 for custom_a2a unit test."
-    assert torch.cuda.is_available(), "CUDA is required for this test."
+
+    expert_offsets = _make_expert_offsets(local_expert_cnt)
+    assert int(local_expert_cnt.sum().item()) == tokens.size(0)
+    for i in range(local_expert_cnt.numel()):
+        cnt = int(local_expert_cnt[i].item())
+        off = int(expert_offsets[i].item())
+        assert off >= 0
+        assert cnt >= 0
+        assert off + cnt <= tokens.size(0)
+
+    out = expert(tokens, weights, local_expert_cnt, num_local_experts)
+    torch.cuda.synchronize()
+
+    ref = ref_expert(tokens, weights, local_expert_cnt).float()
+    out_cpu = out.float().cpu()
+
+    assert out_cpu.shape == ref.shape, f"shape mismatch: {tuple(out_cpu.shape)} vs {tuple(ref.shape)}"
+
+    # debug print must be AFTER out_cpu/ref are defined
+    offset = 0
+    for i in range(local_expert_cnt.numel()):
+        cnt = int(local_expert_cnt[i].item())
+        if cnt > 0:
+            print(f"expert={i}, cnt={cnt}")
+            print("custom:")
+            print(out_cpu[offset:offset+cnt, :4])
+            print("ref:")
+            print(ref[offset:offset+cnt, :4])
+            offset += cnt
+
+    max_diff = (out_cpu - ref).abs().max().item() if out_cpu.numel() > 0 else 0.0
+    print(
+        f"[GEMM] E={num_local_experts} H={token_hid_dim} N={expert_hid_dim} "
+        f"counts={local_expert_cnt.tolist()} max_diff={max_diff:.6f}",
+        flush=True,
+    )
+    assert torch.allclose(out_cpu, ref, atol=atol, rtol=rtol), f"GEMM mismatch, max_diff={max_diff}"
 
 
-def _get_shmem():
-    heap_size = int(os.environ.get("IRIS_HEAP_SIZE", str(1 << 30)))
-    return iris.iris(heap_size)
-
-def gen_gemm_input(num_local_experts, token_hid_dim, expert_hid_dim):
-    expert_token_cnt = torch.randint(low=0, high=100, size=(num_local_experts,))
-
-    tokens = torch.randn(expert_token_cnt.sum(), token_hid_dim)
-
-    weights = torch.randn(num_local_experts, token_hid_dim, expert_hid_dim)
-
-    return tokens, weights
+def test_gemm_small_suite():
+    print("=== Part 1: GEMM small correctness suite ===", flush=True)
+    # deterministic edge cases
+    run_one_gemm_case(2, 64, 64, counts=[0, 0], seed=1)
+    run_one_gemm_case(2, 64, 64, counts=[1, 0], seed=2)
+    run_one_gemm_case(2, 64, 64, counts=[1, 3], seed=3)
+    run_one_gemm_case(4, 128, 64, counts=[0, 1, 2, 7], seed=4)
+    run_one_gemm_case(4, 128, 128, counts=[5, 0, 9, 1], seed=5)
+    run_one_gemm_case(4, 256, 128, counts=[17, 3, 0, 11], seed=6)
 
 
+# =========================================================
+# Part 2. Single-GPU GEMM stress tests
+# =========================================================
 
-def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 32, threshold: float = 1e-2) -> bool:
-    """
-       Routing pattern:
-      Each src sends exactly `cap` rows to every (dst, local_expert).
-      This makes expected placement deterministic and easy to check.
-    """
+def test_gemm_random_stress(num_cases=20):
+    print("=== Part 2: GEMM random stress suite ===", flush=True)
+    _require_cuda()
+    cases = [
+        (2, 64, 64),
+        (4, 128, 64),
+        (4, 128, 128),
+        (4, 256, 128),
+        (8, 256, 256),
+    ]
+
+    for i in range(num_cases):
+        E, H, N = cases[i % len(cases)]
+        run_one_gemm_case(E, H, N, counts=None, seed=100 + i)
+
+
+# =========================================================
+# Part 3. Multi-GPU custom_a2a correctness
+# =========================================================
+
+def test_custom_a2a(world_size: int, e_local: int = 2, hidden_dim: int = 128, cap: int = 32):
     _require_dist()
-    world_size = dist.get_world_size()
     rank = dist.get_rank()
+    world_size = dist.get_world_size()
     experts = e_local * world_size
 
-    # deterministic routing metadata
-    dest_counts = torch.full((world_size, e_local), cap, device="cuda", dtype=torch.int32)
+    # Every sender sends exactly `cap` rows to every (dst, expert) bucket
+    send_counts = torch.full((world_size, e_local), cap, device="cuda", dtype=torch.int32)
+
+    # Sender-side packed layout:
+    # dst_offsets[dst] = starting row for all experts going to dst
     dst_offsets = (torch.arange(world_size, device="cuda", dtype=torch.int32) * (e_local * cap)).contiguous()
 
-    # build unique-valued tokens so misplacement is detectable ---
+    total_rows = world_size * e_local * cap
+    tokens = torch.empty((total_rows, hidden_dim), device="cuda", dtype=torch.bfloat16)
+
+    # Fill each row with rank/src-dst-expert-token identifiable values
+    for dst in range(world_size):
+        base = int(dst_offsets[dst].item())
+        for e in range(e_local):
+            for t in range(cap):
+                row = base + e * cap + t
+                val = float(rank * 1_000_000 + dst * 10_000 + e * 100 + t)
+                tokens[row].fill_(val)
+
+    buffers = alloc_shmem_buffers(
+        world_size=world_size,
+        e_local=e_local,
+        capacity=cap,
+        hidden_dim=hidden_dim,
+        token_dtype=torch.bfloat16,
+    )
+
+    buffers.pca.zero_()
+    buffers.counts_ready.zero_()
+    buffers.token_sync.zero_()
+    buffers.tile_counter.zero_()
+    buffers.token_buf.zero_()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    out = custom_a2a(
+        tokens,
+        send_counts,
+        dst_offsets,
+        buffers.pca,
+        buffers.token_buf,
+        buffers.counts_ready,
+        buffers.token_sync,
+        buffers.tile_counter,
+        buffers.pca_bases,
+        buffers.counts_ready_bases,
+        buffers.token_buf_bases,
+        buffers.token_sync_bases,
+        experts,
+        cap,
+    )
+    torch.cuda.synchronize()
+
+    _spin_wait_counts(buffers, world_size)
+    _spin_wait_token_sync(buffers, cap=cap, world_size=world_size)
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    # Gather sender inputs to build exact expected mapping
+    gathered_in = _all_gather_tensors(tokens)
+
+    # Check pca
+    exp_pca = torch.full((e_local, world_size), cap, device="cuda", dtype=torch.int32)
+    assert torch.equal(buffers.pca, exp_pca), f"[rank{rank}] pca mismatch"
+
+    # Strong block placement check:
+    # out[e, src, :, :] must equal the block that src sent to dst=rank for expert e
+    dst_base = int(dst_offsets[rank].item())
+    for src in range(world_size):
+        src_tokens = gathered_in[src]
+        for e in range(e_local):
+            exp = src_tokens[dst_base + e * cap : dst_base + (e + 1) * cap, :]
+            got = out[e, src, :, :]
+            assert torch.equal(got, exp), f"[rank{rank}] block mismatch src={src} e={e}"
+
+    if rank == 0:
+        print(f"[A2A] PASS e_local={e_local} hidden_dim={hidden_dim} cap={cap}", flush=True)
+
+
+# =========================================================
+# Part 4. Multi-GPU end-to-end smoke:
+# custom_a2a -> shuffle -> expert
+# =========================================================
+
+def test_end_to_end(world_size: int, e_local: int = 2, hidden_dim: int = 128, out_dim: int = 64, cap: int = 16):
+    _require_dist()
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    experts = e_local * world_size
+
+    send_counts = torch.full((world_size, e_local), cap, device="cuda", dtype=torch.int32)
+    dst_offsets = (torch.arange(world_size, device="cuda", dtype=torch.int32) * (e_local * cap)).contiguous()
+
     total_rows = world_size * e_local * cap
     tokens = torch.empty((total_rows, hidden_dim), device="cuda", dtype=torch.bfloat16)
     for dst in range(world_size):
@@ -162,212 +379,152 @@ def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 3
                 val = float(rank * 1_000_000 + dst * 10_000 + e * 100 + t)
                 tokens[row].fill_(val)
 
-    # symmetric buffers
-    #shmem = _get_shmem()
-    cb = alloc_counts_buffers(shmem, world_size=world_size, e_local=e_local)
-    tb = alloc_token_buffers(
-        shmem,
+    # fixed weights, same across ranks
+    _rand_seed(1234)
+    weights = torch.randn((e_local, hidden_dim, out_dim), device="cuda", dtype=torch.bfloat16)
+
+    buffers = alloc_shmem_buffers(
         world_size=world_size,
         e_local=e_local,
         capacity=cap,
         hidden_dim=hidden_dim,
-        token_dtype=tokens.dtype,
+        token_dtype=torch.bfloat16,
     )
 
-    cb.pca.zero_()
-    cb.counts_ready.zero_()
-    tb.token_buf.zero_()
-    tb.token_sync.zero_()
-    #tb.tile_counter.zero_() 
-    tile_counter = torch.zeros((e_local, world_size), device="cuda", dtype=torch.int32)
-    print(f"[rank{rank}] calling custom_a2a e_local={e_local}", flush=True)
-    # the layerop
+    buffers.pca.zero_()
+    buffers.counts_ready.zero_()
+    buffers.token_sync.zero_()
+    buffers.tile_counter.zero_()
+    buffers.token_buf.zero_()
+    torch.cuda.synchronize()
+    dist.barrier()
+
     out = custom_a2a(
         tokens,
-        dest_counts,
+        send_counts,
         dst_offsets,
-        cb.pca,
-        tb.token_buf,
-        cb.counts_ready,
-        tb.token_sync,
-        #tb.tile_counter,
-        tile_counter,
-        cb.heap_bases,
+        buffers.pca,
+        buffers.token_buf,
+        buffers.counts_ready,
+        buffers.token_sync,
+        buffers.tile_counter,
+        buffers.pca_bases,
+        buffers.counts_ready_bases,
+        buffers.token_buf_bases,
+        buffers.token_sync_bases,
         experts,
         cap,
     )
-    print(f"[rank{rank}] returned custom_a2a e_local={e_local}", flush=True)
-
-    # wait via sync vars without barrier or sychornization
-    #while int(cb.counts_ready.item()) < world_size:
-    #    pass
-    #while not bool(torch.all(tb.token_sync == world_size).item()):
-    #    pass
-    _spin_wait_counts(cb, world_size)
-    _spin_wait_tokens(tb, world_size)
-
-    # gather inputs for expected mapping 
-    gathered_in = [torch.empty_like(tokens) for _ in range(world_size)]
-    dist.all_gather(gathered_in, tokens)
-
-    # quick smoke: sums
-    #total_in_sum = torch.stack([x.sum() for x in gathered_in]).sum()
-    #total_out_sum = out.sum()
-    #assert is_correct(total_out_sum, total_in_sum, threshold), "SUM sanity check failed"
-    dst_base = int(dst_offsets[rank].item())
-    expected_local_sum = 0
-    for src in range(world_size):
-        expected_local_sum += gathered_in[src][dst_base : dst_base + e_local * cap, :].sum()
-
-    total_out_sum = out.sum()
-    assert is_correct(total_out_sum, expected_local_sum, threshold), "SUM sanity check failed"
-
-
-    #strong check: exact block placement for dst = rank
-    dst_base = int(dst_offsets[rank].item())
-    for src in range(world_size):
-        src_tokens = gathered_in[src]
-        for e in range(e_local):
-            exp = src_tokens[dst_base + e * cap: dst_base + (e + 1) * cap, :]
-            got = out[e, src, :, :]
-            assert torch.equal(got, exp), f"block mismatch dst={rank} src={src} e={e}"
-
-    return True
-
-   
-
-def test_gemm(total_expert_cnt, token_hid_dim, expert_hid_dim):
-    
-    tokens, weights = gen_gemm_input(total_expert_cnt, token_hid_dim, expert_hid_dim)
-
-    custom_output = expert(tokens, weights,expert_token_cnt,total_expert_cnt)
-
-    ## We use pytorch as ground truth. ##
-    torch_out = []
-    tokens_seen = 0
-    for i in range(total_expert_cnt):
-        torch_out.append(torch.einsum('sd,df->sf', tokens[tokens_seen:expert_token_cnt[i], :], weights[i]))
-        tokens_seen += expert_token_cnt[i]
-
-    return is_correct(custom_output, torch.stack(torch_out), 1e-2)
-
-
-def test_gather_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 32, threshold: float = 1e-2) -> bool:
-    """
-    Test the gather (pull) all-to-all against the PyTorch baseline.
-
-    Each rank builds a deterministic send payload where every token row
-    is filled with a unique value encoding (rank, dst, expert, token_id).
-    We run both the custom gather a2a and the baseline a2a, then compare
-    the gathered output tensors.
-    """
-    _require_dist()
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    device = torch.device(f"cuda:{rank}")
-
-    # --- Build deterministic routing: each rank sends `cap` tokens to every (dst, expert). ---
-    send_counts = torch.full((world_size, e_local), cap, device=device, dtype=torch.int32)
-    dst_offsets = _build_dst_offsets(send_counts)
-
-    total_rows = world_size * e_local * cap
-    tokens = torch.empty((total_rows, hidden_dim), device=device, dtype=torch.bfloat16)
-    for dst in range(world_size):
-        base = int(dst_offsets[dst].item())
-        for e in range(e_local):
-            for t in range(cap):
-                row = base + e * cap + t
-                val = float(rank * 1_000_000 + dst * 10_000 + e * 100 + t)
-                tokens[row].fill_(val)
-
-    # --- Allocate symmetric memory buffers for the gather a2a. ---
-    # cnts and offsets must live in symmetric memory so other ranks can read them.
-    shmem_cnts = shmem.zeros((world_size, e_local), dtype=torch.int64, device="cuda")
-    shmem_offsets = shmem.zeros((world_size,), dtype=torch.int64, device="cuda")
-    shmem_tokens = shmem.zeros((total_rows, hidden_dim), dtype=tokens.dtype, device="cuda")
-    heap_bases = shmem.get_heap_bases()
-
-    # Populate symmetric buffers with this rank's data.
-    shmem_cnts.copy_(send_counts.to(torch.int64))
-    shmem_offsets.copy_(dst_offsets.to(torch.int64))
-    shmem_tokens.copy_(tokens)
-
-    # Ensure all ranks have written their symmetric buffers before pulling.
-    shmem.barrier()
-
-    # --- Run custom gather a2a. ---
-    gathered = gather_a2a(shmem_cnts, shmem_offsets, heap_bases, e_local, shmem_tokens)
-    torch.cuda.synchronize()
-    shmem.barrier()
-
-    # --- Run baseline a2a to get expected result. ---
-    # exchange_counts_a2a gives us recv_counts[src, e] = tokens src sends to our expert e.
-    total_recv_upper = world_size * e_local * cap
-    base_bufs = init_baseline_buffers(
-        world_size, e_local, cap, hidden_dim, tokens.dtype, device, total_recv_upper,
-    )
-    recv_counts = exchange_counts_a2a(send_counts, base_bufs, strict_capacity=False, capacity=cap)
-    recv_flat, _, _ = exchange_payload_a2a(tokens, send_counts, recv_counts, base_bufs)
     torch.cuda.synchronize()
 
-    # recv_flat is packed [src0_e0, src0_e1, ..., src1_e0, ...] which is expert-minor within each src.
-    # gathered is packed expert-major: [e0_src0, e0_src1, ..., e1_src0, ...] (from write_meta layout).
-    # Reorder baseline into the same expert-major layout for comparison.
-    expected = torch.zeros_like(gathered)
-    baseline_off = 0
-    # Build the same write_meta offsets the kernel uses.
-    # expert-major, device-minor: all tokens for expert 0 first, then expert 1, etc.
-    write_off = {}
-    running = 0
+    _spin_wait_counts(buffers, world_size)
+    _spin_wait_token_sync(buffers, cap=cap, world_size=world_size)
+    packed_tokens = shuffle(buffers.token_buf, buffers.pca, buffers.token_sync, cap)
+    torch.cuda.synchronize()
+
+    local_expert_cnt = buffers.pca.sum(dim=1).to(torch.int32)
+    out_custom = expert(packed_tokens, weights, local_expert_cnt, experts)
+    torch.cuda.synchronize()
+
+    # Build exact packed reference order: pca.view(-1) row-major => expert-major then src-major
+    gathered_in = _all_gather_tensors(tokens)
+    dst_base = int(dst_offsets[rank].item())
+
+    ref_chunks = []
     for e in range(e_local):
         for src in range(world_size):
-            c = int(recv_counts[src, e].item())
-            write_off[(src, e)] = running
-            running += c
+            src_tokens = gathered_in[src]
+            chunk = src_tokens[dst_base + e * cap : dst_base + (e + 1) * cap, :]
+            ref_chunks.append(chunk)
 
-    for src in range(world_size):
-        for e in range(e_local):
-            c = int(recv_counts[src, e].item())
-            if c > 0:
-                wo = write_off[(src, e)]
-                expected[wo:wo + c] = recv_flat[baseline_off:baseline_off + c]
-            baseline_off += c
+    ref_packed = torch.cat(ref_chunks, dim=0)
+    assert torch.equal(packed_tokens, ref_packed), f"[rank{rank}] packed_tokens mismatch"
 
-    # --- Compare. ---
-    if gathered.shape != expected.shape:
-        print(f"[rank{rank}] FAIL: shape mismatch gathered={gathered.shape} expected={expected.shape}")
-        return False
+    ref_out = ref_expert(ref_packed, weights, local_expert_cnt).float()
+    out_custom_cpu = out_custom.float().cpu()
 
-    if not torch.allclose(gathered.float(), expected.float(), rtol=threshold, atol=threshold):
-        max_diff = (gathered.float() - expected.float()).abs().max().item()
-        print(f"[rank{rank}] FAIL: max_diff={max_diff}")
-        return False
+    max_diff = (out_custom_cpu - ref_out).abs().max().item() if out_custom_cpu.numel() > 0 else 0.0
+
+    assert out_custom_cpu.shape == ref_out.shape
+    assert torch.allclose(out_custom_cpu, ref_out, atol=2e-2, rtol=2e-2), \
+        f"[rank{rank}] e2e output mismatch max_diff={max_diff}"
 
     if rank == 0:
-        print(f"[rank{rank}] gather_a2a test PASSED (e_local={e_local}, H={hidden_dim}, cap={cap})")
-    return True
+        print(
+            f"[E2E] PASS e_local={e_local} hidden_dim={hidden_dim} out_dim={out_dim} cap={cap} "
+            f"max_diff={max_diff:.6f}",
+            flush=True,
+        )
 
 
-def _worker_gather(local_rank: int, world_size: int) -> None:
-    _init_dist_tcp(local_rank, world_size)
-    shmem = _get_shmem()
-    print(f"[rank{local_rank}] init ok, cuda={torch.cuda.current_device()}", flush=True)
+# =========================================================
+# Dist worker
+# =========================================================
+
+def _worker(rank: int, world_size: int, mode: str, master_port: str):
+    _init_dist_tcp(rank, world_size, master_port=master_port)
+
     try:
-        test_gather_a2a(shmem, e_local=16, hidden_dim=128, cap=32)
-        test_gather_a2a(shmem, e_local=16, hidden_dim=256, cap=16)
-        if local_rank == 0:
-            print("All gather_a2a tests finished")
+        symmem.enable_symm_mem_for_group(dist.group.WORLD.group_name)
+        dist.barrier()
+        torch.cuda.synchronize()
+
+        if rank == 0:
+            print(f"[DIST] mode={mode} world_size={world_size}", flush=True)
+
+        if mode in ("a2a", "all"):
+            test_custom_a2a(world_size=world_size, e_local=2, hidden_dim=128, cap=32)
+
+        if mode in ("e2e", "all"):
+            test_end_to_end(world_size=world_size, e_local=2, hidden_dim=128, out_dim=64, cap=16)
+
+        if rank == 0:
+            print("[DIST] PASS", flush=True)
+
     finally:
-        dist.destroy_process_group()
+        _destroy_dist()
 
 
-if __name__ == '__main__':
-   
-    world_size = 2
+# =========================================================
+# Main
+# =========================================================
 
-    # Scatter (push) a2a tests.
-    # mp.spawn(_worker, args=(world_size,), nprocs=world_size, join=True)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="all",
+        choices=["gemm", "a2a", "e2e", "all"],
+        help="gemm = single-GPU only; a2a/e2e/all need multi-GPU",
+    )
+    parser.add_argument("--world-size", type=int, default=2)
+    parser.add_argument("--master-port", type=str, default="29500")
+    args = parser.parse_args()
 
-    # Gather (pull) a2a tests.
-    mp.spawn(_worker_gather, args=(world_size,), nprocs=world_size, join=True)
-    
+    print("RUNNING unit_tests from:", __file__, flush=True)
+
+    if args.mode == "gemm":
+        _require_cuda()
+        torch.cuda.set_device(0)
+        test_gemm_small_suite()
+        test_gemm_random_stress(num_cases=20)
+        print("[GEMM] PASS", flush=True)
+        return
+
+    # multi-GPU modes
+    _require_cuda()
+    assert torch.cuda.device_count() >= args.world_size, (
+        f"Need at least {args.world_size} GPUs, got {torch.cuda.device_count()}"
+    )
+
+    mp.spawn(
+        _worker,
+        args=(args.world_size, args.mode, args.master_port),
+        nprocs=args.world_size,
+        join=True,
+    )
+
+
+if __name__ == "__main__":
+    main()

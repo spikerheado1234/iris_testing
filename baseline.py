@@ -280,6 +280,7 @@ def run_baseline_ref(
         buffers=buffers,
     )
     e2.record()
+    torch.cuda.synchronize()
     t["step2_ms"] = _elapsed_ms(s2, e2)
 
     meta["in_splits"] = in_splits

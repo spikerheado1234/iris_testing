@@ -1,66 +1,120 @@
 import torch
 import torch.nn.functional as F
 
-from .kernels import grouped_gemm
+from kernels import grouped_gemm
+
+
+import triton
+
+import os
+import torch.distributed as dist
 
 class Expert(torch.autograd.Function):
-
     @staticmethod
     def forward(
-        ctx, 
-        # Local buffers 
-        tokens, weights,
-        local_expert_cnt,
+        ctx,
+        tokens,              # [S, H]
+        weights,             # [E, H, N]
+        local_expert_cnt,    # [E]
         aggregrate_exp_cnt
     ):
-    """
-    Expert GeMM compute stage. This layer: Computes a single layer MLP
-    for all local experts.
+        if tokens.numel() == 0:
+            return torch.empty(
+                (0, weights.size(-1)),
+                dtype=tokens.dtype,
+                device=tokens.device,
+            )
 
-    Args:
-        ctx: context required for torch fwd/bwd pass.
-        tokens (Tensor): [S, hidden_dim]-sized tensor. S is the packed size of the tensor
-            (without zero-padding).
-        weights (Tensor): [E, hidden_dim, ffn_hidden_dim]-sized tensor representation MLP 
-            weights per expert.
-        local_expert_cnt (Tensor): [E]-sized tensor representing the total number of tokens
-            corresponding to expert i on the current rank.
-        aggregrate_exp_cnt (int): the total number of experts across all devices.
-    """
+        device = tokens.device
+        E = weights.size(0)
+        H = weights.size(1)
+        N = weights.size(2)
+        S = tokens.size(0)
 
-        local_expert_count = torch.Tensor(1).to(int32) + (expert_cnt // dist.get_world_size)
+        # prefix offsets for packed tokens
+        expert_offsets = torch.zeros_like(local_expert_cnt, dtype=torch.int32, device=device)
+        if E > 1:
+            expert_offsets[1:] = local_expert_cnt.cumsum(dim=0)[:-1].to(torch.int32)
 
-        BLOCK_SIZE_M = 64
-        BLOCK_SIZE_N = 64
-        BLOCK_SIZE_K = 64
-        NUM_SM = 142
+        out = torch.empty((S, N), dtype=tokens.dtype, device=device)
 
-        if torch.is_cuda():
-            NUM_SM = torch.cuda.get_device_properties("cuda").multi_processor_count
+        BLOCK_M = 64
+        BLOCK_N = 64
+        BLOCK_K = 32
 
-        gemm_grid = (NUM_SM,)
+        # total tile count across all experts
+        
+        cnt_host = local_expert_cnt.tolist()
+        pid_to_expert_host = []
+        pid_to_m_host = []
+        pid_to_n_host = []
 
-        processed_tokens = torch.zeros((tokens.shape[0], weights.size(-1)), dtype=tokens.dtype).to(tokens.device)
-        # Finally, launch the grouped-gemm kernel.
-        grouped_gemm[gemm_grid](
+        for g, cnt in enumerate(cnt_host):
+            if cnt <= 0:
+                continue
+            m_tiles = triton.cdiv(cnt, BLOCK_M)
+            n_tiles = triton.cdiv(N, BLOCK_N)
+            for tm in range(m_tiles):
+                for tn in range(n_tiles):
+                    pid_to_expert_host.append(g)
+                    pid_to_m_host.append(tm)
+                    pid_to_n_host.append(tn)
+
+        total_tiles = len(pid_to_expert_host)
+        pid_to_expert = torch.tensor(pid_to_expert_host, device=device, dtype=torch.int32)
+        pid_to_m = torch.tensor(pid_to_m_host, device=device, dtype=torch.int32)
+        pid_to_n = torch.tensor(pid_to_n_host, device=device, dtype=torch.int32)
+
+
+        if len(pid_to_expert_host) == 0:
+            return out
+
+        total_tiles = len(pid_to_expert_host)
+        pid_to_expert = torch.tensor(pid_to_expert_host, device=device, dtype=torch.int32)
+        pid_to_m = torch.tensor(pid_to_m_host, device=device, dtype=torch.int32)
+        pid_to_n = torch.tensor(pid_to_n_host, device=device, dtype=torch.int32)
+
+        grid = (total_tiles,)
+        ### debugging info
+        if os.environ.get("DEBUG_GGEMM", "0") == "1":
+            rank = dist.get_rank() if dist.is_initialized() else -1
+            print(f"[GGEMM][rank{rank}] S={S}, E={E}, H={H}, N={N}", flush=True)
+            print(f"[GGEMM][rank{rank}] local_expert_cnt={local_expert_cnt.tolist()}", flush=True)
+            print(f"[GGEMM][rank{rank}] expert_offsets={expert_offsets.tolist()}", flush=True)
+            print(f"[GGEMM][rank{rank}] total_tiles={total_tiles}, grid={grid}", flush=True)
+        assert int(local_expert_cnt.sum().item()) == S, f"sum(local_expert_cnt)={int(local_expert_cnt.sum().item())}, S={S}"
+
+        for i in range(E):
+            cnt = int(local_expert_cnt[i].item())
+            off = int(expert_offsets[i].item())
+            assert cnt >= 0
+            assert off >= 0
+            assert off + cnt <= S, f"expert {i}: off={off}, cnt={cnt}, S={S}"
+        ###
+
+        grouped_gemm[grid](
             tokens,
-            weights, 
-            processed_tokens, # Shape: [S, expert_hidden_dim]
-            local_expert_cnt, # Shape: [E], token count per expert.
-            NUM_SM,
-            expert_cnt // dist.get_world_size(),
-            tokens.size(-1),
-            weights.size(-1),
-            # tile sizes
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            BLOCK_SIZE_K=BLOCK_SIZE_K
+            weights,
+            out,
+            local_expert_cnt,
+            expert_offsets,
+            pid_to_expert,
+            pid_to_m,
+            pid_to_n,
+            NUM_SM=1,  # keep simple first
+            expert_cnt=E,
+            hidden_dim=H,
+            expert_hidden_dim=N,
+            BLOCK_SIZE_M=BLOCK_M,
+            BLOCK_SIZE_N=BLOCK_N,
+            BLOCK_SIZE_K=BLOCK_K,
         )
 
-    return processed_tokens 
+        return out
 
     @staticmethod
     def backward(ctx, do):
-        raise NotImplementedError('Backward pass not implemented yet.')
+        raise NotImplementedError("Backward pass not implemented yet.")
+
 
 expert = Expert.apply
