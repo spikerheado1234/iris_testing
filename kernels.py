@@ -261,13 +261,13 @@ def counts_exchange_pull(
     remote_offsets_base = tl.cast(remote_offsets_base_i64, tl.pointer_type(tl.int64))
     off_val = tl.load(remote_offsets_base + src_rank)
     tl.store(local_expert_offset_idxs + dev_id, off_val)
+    # maybe we dont need the lock here
+    #tl.atomic_add(cnt_exchange_sync, 1, sem="release", scope="sys")
 
-    tl.atomic_add(cnt_exchange_sync, 1, sem="release", scope="sys")
-
-    ws = tl.full((), world_size, tl.int32)
-    v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem="acquire", scope="sys")
-    while v != ws:
-       v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem="acquire", scope="sys")
+    #ws = tl.full((), world_size, tl.int32)
+    #v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem="acquire", scope="sys")
+    #while v != ws:
+    #   v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem="acquire", scope="sys")
 
 ## TODO(ahangupta): if this consumes too much runtime, we can migrate this into
 ##                      a triton kernel as well.
