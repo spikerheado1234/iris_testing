@@ -46,18 +46,17 @@ class AllToAllGatherOp(torch.autograd.Function):
         ## New sort of initilization $$
         world_size = dist.get_world_size()
         rank = dist.get_rank()
-        device = tokens.device 
+        device = tokens.device
 
+        #print(f"[rank{rank}] gather: enter forward", flush=True)
 
-        ## We first instantiate local buffers. ##
         local_expert_cnts = torch.zeros((world_size, e_local), dtype=torch.int64, device=device)
         local_expert_offset_idxs = torch.zeros((world_size,), dtype=torch.int64, device=device)
         cnt_exchange_sync = torch.zeros((1,), dtype=torch.int32, device=device)
 
-
-        ## Next, launch the first metadata exchange. ##
         BLOCK_M = 64
-        nvtx_push("Stage1_Meta_Pull")
+
+        #print(f"[rank{rank}] gather: before stage1 launch", flush=True)
         counts_exchange_pull[(world_size,)](
             cnts_bases=cnts_bases,
             offsets_bases=offsets_bases,
@@ -69,22 +68,20 @@ class AllToAllGatherOp(torch.autograd.Function):
             e_local=e_local,
             BLOCK_M=BLOCK_M,
         )
-        nvtx_pop()
-
-
-        ## Then, intermediate ops. ##
-        nvtx_push("Stage1.5_Roll_Cum_Sum")
+        #print(f"[rank{rank}] gather: after stage1 launch", flush=True)
+        #print(f"[rank{rank}] gather: before stage1 cuda synchronize", flush=True)
+        torch.cuda.synchronize(device)
+        #print(f"[rank{rank}] gather: after stage1 cuda synchronize", flush=True)
+        #print(f"[rank{rank}] gather: before roll_cum_sum", flush=True)
         read_meta, write_meta = roll_cum_sum(local_expert_cnts, local_expert_offset_idxs)
-
+        #print(f"[rank{rank}] gather: after roll_cum_sum", flush=True)
         total_recv = int(local_expert_cnts.sum().item())
         gathered_tokens = torch.empty((total_recv, tokens.shape[-1]), dtype=tokens.dtype, device=device)
         token_sync = torch.zeros((world_size, e_local), dtype=torch.int32, device=device)
-        
         max_cnt = max(int(local_expert_cnts.max().item()), 1)
-        nvtx_pop()
 
-        ## Finally, launch the next kernel. ##
-        nvtx_push("Stage2_Token_Pull")
+        #print(f"[rank{rank}] gather: after roll_cum_sum total_recv={total_recv} max_cnt={max_cnt}", flush=True)
+
         token_exchange_pull[(world_size, e_local, max_cnt)](
             tokens_bases=tokens_bases,
             read_meta=read_meta,
@@ -99,13 +96,11 @@ class AllToAllGatherOp(torch.autograd.Function):
             BLOCK_K=256,
             num_warps=4,
         )
-              
-        ## wait for everything finished ##
-        #target = local_expert_cnts.to(torch.int32)
-        #while not bool(torch.equal(token_sync, target)):
-        #    pass
+        #print(f"[rank{rank}] gather: after stage2 launch", flush=True)
+
+        #print(f"[rank{rank}] gather: before final cuda synchronize", flush=True)
         torch.cuda.synchronize(device)
-        nvtx_pop()
+        #print(f"[rank{rank}] gather: after final cuda synchronize", flush=True)
 
         return gathered_tokens
 
