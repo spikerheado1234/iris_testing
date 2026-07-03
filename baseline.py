@@ -280,6 +280,7 @@ def run_baseline_ref(
         buffers=buffers,
     )
     e2.record()
+    torch.cuda.synchronize()
     t["step2_ms"] = _elapsed_ms(s2, e2)
 
     meta["in_splits"] = in_splits
@@ -303,3 +304,29 @@ def run_baseline_ref(
         t["reorder_ms"] = 0.0
 
     return token_buf, t, meta
+
+def baseline_expert_sequential(
+    recv_payload_flat: torch.Tensor,   # [total_recv, H], src-major / expert-minor
+    recv_counts: torch.Tensor,         # [world_size, e_local]
+    weights: torch.Tensor,             # [e_local, H, N]
+) -> torch.Tensor:
+    world_size, e_local = recv_counts.shape
+    H = recv_payload_flat.shape[1]
+    N = weights.shape[2]
+
+    out_chunks = []
+    off = 0
+
+    for src in range(world_size):
+        for e in range(e_local):
+            c = int(recv_counts[src, e].item())
+            if c > 0:
+                x = recv_payload_flat[off:off + c]   # [c, H]
+                w = weights[e]                       # [H, N]
+                out_chunks.append(torch.matmul(x, w))
+            off += c
+
+    if len(out_chunks) == 0:
+        return torch.empty((0, N), device=recv_payload_flat.device, dtype=recv_payload_flat.dtype)
+
+    return torch.cat(out_chunks, dim=0)
