@@ -7,8 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-import iris
-
 """
 world = DeviceCount E = E_local = T 
 H = hidden_dimension 
@@ -16,179 +14,210 @@ CAP = max_{e,s} pca[e,s]
 Capcity in real moe 
 """
 
-################################################################
-## These Kernels implement a scatter approach (pushing the data.)
-###############################################################
 
-# Step-1 kernel: counts exchange
+
 @triton.jit
 def counts_exchange_kernel(
-    send_counts_ptr,  # [world, E] int32 (local)
-    pca_ptr,  # [E, world] int32 (symmetric on dst)
-    counts_ready_ptr,  # [1] int32 (symmetric on dst)
-    heap_bases,
+    send_counts_ptr,  
+    pca_ptr,          
+    counts_ready_ptr, 
+    # New arguments: Base pointer lists
+    pca_bases_ptr,         # [World] Ptr to PCA buffer start on each rank
+    counts_ready_bases_ptr,# [World] Ptr to Ready buffer start on each rank
+    # *,
     src_rank: tl.constexpr,
     world_size: tl.constexpr,
     e_local: tl.constexpr,
     BLOCK_E: tl.constexpr,
 ):
-    """Write counts to each dst's PCA[:, src_rank], then signal counts_ready++ on dst."""
-
-    dst = tl.program_id(0)  # one program per destination rank
+    dst = tl.program_id(0)
     
-    
-
-    # Write the E counts for this destination.
     for e0 in tl.static_range(0, e_local, BLOCK_E):
         e = e0 + tl.arange(0, BLOCK_E)
         mask_e = e < e_local
+        
+        # 1. Load Local Counts
+        vals = tl.load(send_counts_ptr + dst * e_local + e, mask=mask_e, other=0)
+        
+        # 2. Store Remote (Native Put)
+        # Logical position in remote PCA: pca[e, src_rank]
+        # Offset calculation: (e * world_size + src_rank)
+        offset = (e * world_size + src_rank)
+        
+        # Load remote base address for the destination rank
+        remote_base = tl.load(pca_bases_ptr + dst).to(tl.pointer_type(tl.int32))
+        remote_ptr = remote_base + offset
+        tl.store(remote_ptr, vals, mask=mask_e)
+        
+    tl.debug_barrier() 
 
-        # Remote write: pca[e, src_rank] on destination.
-        src_ptr = send_counts_ptr + dst * e_local + e  # new pointer 
-        remote_ptr = pca_ptr + e * world_size + src_rank 
-             
-        iris.put( 
-            src_ptr,            # from_ptr: pointer
-            remote_ptr,         # to_ptr: pointer
-            from_rank=src_rank,
-            to_rank=dst,
-            heap_bases=heap_bases,
-            mask=mask_e,        
-        )
+    # 3. Remote ocmpletion signal
+    remote_ready_base = tl.load(counts_ready_bases_ptr + dst).to(tl.pointer_type(tl.int32))
+    ptr_vec = remote_ready_base + tl.zeros((BLOCK_E,), dtype=tl.int32)
+    mask_0 = tl.arange(0, BLOCK_E) == 0
+    tl.atomic_add(ptr_vec, 1, mask=mask_0, sem="release")
 
 
-    # Signal completion to destination (release semantics).
-    iris.atomic_add( 
-        counts_ready_ptr,
-        1,
-        src_rank,
-        dst,
-        heap_bases,
-        sem="release",
-        scope="sys",
-    )
-    # spin wait on elocal variables that waits
-
-# Step-2 kernel: token exchange with the original logic
 @triton.jit
 def tokens_exchange_kernel(
-    send_ptr,            # [sum_send, H]
-    send_counts_ptr,     # [W, E] int32 local
-    dst_offsets_ptr,     # [W] int32 local
-    expert_offs_ptr,     # [W, E] int32 local (prefix within dst block)
-    token_buf_ptr,       # [E, W, CAP, H] symmetric on dst
-    token_sync_ptr,      # [E] int32 symmetric on dst
-    tile_counter_ptr,    # [E, W] int32 LOCAL scratch on src (we repurpose it!)
-    heap_bases,
+    send_ptr,            
+    send_counts_ptr,     
+    dst_offsets_ptr,     
+    expert_offs_ptr,     
+    token_buf_ptr,       
+    token_sync_ptr,      
+    tile_counter_ptr,    
+    # New arguments: Base pointer lists
+    token_buf_bases_ptr,  # [World]
+    token_sync_bases_ptr, # [World]
     src_rank: tl.constexpr,
     world_size: tl.constexpr,
     e_local: tl.constexpr,
     CAP: tl.constexpr,
     hidden_dim: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    TILE_SIZE: tl.constexpr,   # new tile size
+    MAX_TILES: tl.constexpr, # new max tile num
 ):
-    # grid = (dst, expert, token_id)
+
     dst    = tl.program_id(0)
     expert = tl.program_id(1)
-    tid    = tl.program_id(2)  # token row id within this (dst, expert)
+    tile_id = tl.program_id(2) # RECV tile_id now
 
-  
-
-    # how many rows to send to (dst, expert)
     n = tl.load(send_counts_ptr + dst * e_local + expert).to(tl.int32)
     n_eff = tl.minimum(n, tl.full((), CAP, tl.int32))
-    
-    # If no tokens: ONE program (tid==0) sends completion signal.
-    if tid == 0:
+
+    # Signal 0 tokens case
+    if tile_id == 0:
         if n_eff == 0:
-            iris.atomic_add(
-                token_sync_ptr + expert, 1,
-                src_rank, dst, heap_bases,
-                sem="release", scope="sys",
-            )
+            remote_sync_base = tl.load(token_sync_bases_ptr + dst).to(tl.pointer_type(tl.int32))
+            remote_sync_offset = (expert * world_size * MAX_TILES) + (src_rank * MAX_TILES) + 0
+            ptr_vec = remote_sync_base + remote_sync_offset + tl.zeros((BLOCK_K,), dtype=tl.int32)
+            mask_0 = tl.arange(0, BLOCK_K) == 0
+            tl.atomic_xchg(ptr_vec, 1, mask=mask_0, sem="release")
             return
 
-    # Only valid token-ids participate
-    if tid >= n_eff:
+    tile_start_tid = tile_id * TILE_SIZE
+    if tile_start_tid >= n_eff:
         return
 
-    # send row index in packed send payload
+    tokens_in_this_tile = tl.minimum(TILE_SIZE, n_eff - tile_start_tid)
+
     dst_base  = tl.load(dst_offsets_ptr + dst).to(tl.int32)
     e_off     = tl.load(expert_offs_ptr + dst * e_local + expert).to(tl.int32)
-    send_row  = dst_base + e_off + tid
+    remote_token_base = tl.load(token_buf_bases_ptr + dst).to(tl.pointer_type(tl.bfloat16))
 
-    # remote base for this (expert, src_rank) slice on destination
-    # [FIX] Cast to int64 to avoid overflow when CAP*H is large (>2GB)
-    remote_base = (expert.to(tl.int64) * world_size + src_rank) * CAP * hidden_dim
-    remote_row  = tid  # place at row=tid inside [CAP, H]
+    # 64 tokens in a row
 
-    # copy one token row, BLOCK_K across hidden dim
-    for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
-        offs_k = k0 + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < hidden_dim
+    for offset in range(TILE_SIZE):
+        # no break support so use if here
+        if offset < tokens_in_this_tile:
+            tid = tile_start_tid + offset
+            send_row = dst_base + e_off + tid
+            row_offset = (expert.to(tl.int64) * world_size + src_rank) * CAP * hidden_dim + tid * hidden_dim
+            
+            for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
+                offs_k = k0 + tl.arange(0, BLOCK_K)
+                k_mask = offs_k < hidden_dim
+                vals = tl.load(send_ptr + send_row * hidden_dim + offs_k, mask=k_mask)
+                remote_ptr = remote_token_base + row_offset + offs_k
+                tl.store(remote_ptr, vals, mask=k_mask)
 
-        send_ptrs   = send_ptr + send_row * hidden_dim + offs_k
-        remote_ptrs = token_buf_ptr + remote_base + remote_row * hidden_dim + offs_k
+    my_counter_offset = (expert * world_size * MAX_TILES) + (dst * MAX_TILES) + tile_id
+    counter_ptr_vec = tile_counter_ptr + my_counter_offset + tl.zeros((BLOCK_K,), dtype=tl.int32)
+    
+    # 2. Local completion accounting: each thread +1 with its old value
+    # use acq_rel to ensure the last thread can see the store results from other threads
+    old_val = tl.atomic_add(counter_ptr_vec, 1, sem="acq_rel")
+    
+    # 3. Final completion signal: he who gets BLOCK_K - 1, is the last one to finish
+    mask_last = (old_val == BLOCK_K - 1)
+    
+    remote_sync_base = tl.load(token_sync_bases_ptr + dst).to(tl.pointer_type(tl.int32))
+    remote_sync_offset = (expert * world_size * MAX_TILES) + (src_rank * MAX_TILES) + tile_id
+    remote_ptr_vec = remote_sync_base + remote_sync_offset + tl.zeros((BLOCK_K,), dtype=tl.int32)
+    
+    # only the last thread will emit the final remote unlock signal, releasing all threads at once!
+    tl.atomic_xchg(remote_ptr_vec, 1, mask=mask_last, sem="release")
 
-        iris.put(
-            send_ptrs,
-            remote_ptrs,
-            from_rank=src_rank,
-            to_rank=dst,
-            heap_bases=heap_bases,
-            mask=k_mask,
-        )
+@triton.jit
+def token_shuffle(
+    pca_cumsum_ptr, pca_ptr, 
+    token_buffer_ptr, 
+    output_buffer_ptr, 
+    token_sync_ptr,           # now to the 3D matrix [E, W, MAX_TILES]
+    E: tl.constexpr, world_size: tl.constexpr,
+    mxa: tl.constexpr, hidden_dim: tl.constexpr,
+    BLOCK_X: tl.constexpr,
+    TILE_SIZE: tl.constexpr,  # new size of tile 64
+    MAX_TILES: tl.constexpr   # new max tile para
+):
+    """
+    #Triton kernel that reshuffles data post all-to-all (prior to expert compute) 
+    #to eliminate zero-padding.
 
-    # local completion accounting (ON SRC GPU)
-    # tile_counter_ptr used as LOCAL scratch: tile_counter[expert, dst] counts completed tokens
-    ctr_ptr = tile_counter_ptr + expert * world_size + dst
-    tl.atomic_add(ctr_ptr, 1, sem="release", scope="sys")
+    #Args:
+    #    pca_cumsum_ptr (Tensor): [E, world_size]-sized physical counts array. 
+    #        pca_cumsum_ptr[i, j] = x means x tokens 
+    #    pca_ptr (Tensor): [E, world_size]-sized physical counts array.
+    #        pca_ptr[i, j] = x represents that x tokens are routed from device j
+    #        to expert i on the current rank.
+    #    token_buffer_ptr (Tensor): [E, world_size, capacity, hidden_dim]-sized tensor.
+    #        the output buffer that the all-to-all writes to.
+    #    token_sync_ptr (Tensor): [E]-sized tensor. These are synchronization variables
+    #        set by the prior all-to-all to ensure correctness.
+    #    E (int): number of *local* experts.
+    #    world_size (int): number of participating ranks.
+    #    mxa (int): maximum capaicty (2nd dimension of the token_buffer_ptr array).
+    #    hidden_dim (int): token hidden-dimensions.
+"""
+   
+    expert = tl.program_id(0)
+    dev_id = tl.program_id(1)
+    token_id = tl.program_id(2)
 
-    # ONE program spins until all tokens for this (dst, expert) done, then signals dst.token_sync[expert] += 1
-    if tid == 0:
-        # stage=1 : entering spin
-        # spin wait
-        v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='sys')
-        ## For some reason, without it, spin-lock in 152 deadlocks. ##
-        tl.debug_barrier()            
-        while v != n_eff:
-            v = tl.atomic_cas(ctr_ptr, n_eff, n_eff, sem='acquire', scope='sys')
+    num_tokens = tl.load(pca_ptr + (expert * world_size + dev_id).to(tl.int64))
 
-        iris.atomic_add(
-            token_sync_ptr + expert, 1,
-            src_rank, dst, heap_bases,
-            sem="release", scope="sys",
-        )
- 
-################################################################
-## These Kernels implement a gather approach (pulling the data.)
-###############################################################
+    if num_tokens <= token_id:
+        return 
 
-#@triton.autotune(
-#    configs=[
-#        triton.Config({'BLOCK_M': 16}, num_warps=2),
-#        triton.Config({'BLOCK_M': 16}, num_warps=4),
-#        triton.Config({'BLOCK_M': 32}, num_warps=2),
-#        triton.Config({'BLOCK_M': 32}, num_warps=4),
-#        triton.Config({'BLOCK_M': 64}, num_warps=2),
-#        triton.Config({'BLOCK_M': 64}, num_warps=4),
-#    ],
-#    key=['e_local'],
-#)
+    # 3D super fast Spin-lock
+   
+    tile_id = token_id // TILE_SIZE
+    sync_offset = (expert * world_size * MAX_TILES) + (dev_id * MAX_TILES) + tile_id
+   
+    
+    
+    offs = tl.arange(0, BLOCK_X)
+    inp_ptrs = expert * world_size * mxa * hidden_dim + dev_id * mxa * hidden_dim + token_id * hidden_dim + offs
+    cum_summed_prev = tl.load(pca_cumsum_ptr + (expert * world_size + dev_id).to(tl.int64))
+    
+    # Add offs to match the token layout.
+    packed_ptrs = (cum_summed_prev + token_id) * hidden_dim + offs
+    
+    for i in tl.range(0, tl.cdiv(hidden_dim, BLOCK_X)):
+        # safer mask
+        mask = (i * BLOCK_X + offs) < hidden_dim
+        tkns = tl.load(token_buffer_ptr + inp_ptrs, mask=mask)
+        tl.store(output_buffer_ptr + packed_ptrs, tkns, mask=mask)
+        
+        packed_ptrs += BLOCK_X
+        inp_ptrs += BLOCK_X
+
+
 @triton.jit
 def counts_exchange_pull(
     ############################################
     ### These two buffers are for READING ONLY. 
     ############################################
-    cnts,  # [world_size, expert_pack] (symmetric memory, addressable by all devices)
-    offsets, # [world_size] (symmetric memory, addressable by all devices)
+    cnts_bases,  # [world_size] (symmetric memory, addressable by all devices) int64
+    offsets_bases,   # [world_size] (symmetric memory, addressable by all devices) int64
     ################################################
     ### These three buffers are for Writing ONLY. 
     ################################################
-    local_expert_cnts, # [world_size, expert_pack] (local memory)
-    local_expert_offset_idxs, # [world_size] (local memory)
-    cnt_exchange_sync, # [1] (unit-sized array in local memory)
-    heap_bases,
+    local_expert_cnts, # [world_size, expert_pack] (local memory) int64
+    local_expert_offset_idxs, # [world_size] (local memory) int64
+    cnt_exchange_sync, # [1] (unit-sized array in local memory)  int32 
     src_rank: tl.constexpr,
     world_size: tl.constexpr,
     e_local: tl.constexpr,
@@ -219,32 +248,26 @@ def counts_exchange_pull(
     """
     dev_id = tl.program_id(0)
 
-    iris.get(
-        cnts + src_rank * e_local + tl.arange(0, BLOCK_M),
-        local_expert_cnts + dev_id * e_local + tl.arange(0, BLOCK_M),
-        from_rank=src_rank,
-        to_rank=dev_id,
-        heap_bases=heap_bases,
-        mask=tl.arange(0, BLOCK_M) < e_local
-    )
+    offs = tl.arange(0, BLOCK_M)
+    mask = offs < e_local
 
-    iris.get(
-        offsets + src_rank,
-        local_expert_offset_idxs + dev_id,
-        from_rank=src_rank,
-        to_rank=dev_id,
-        heap_bases=heap_bases,
-        mask=None
-    )
+    remote_cnts_base_i64 = tl.load(cnts_bases + dev_id)
+    remote_cnts_base = tl.cast(remote_cnts_base_i64, tl.pointer_type(tl.int64))
+    remote_cnts_ptrs = remote_cnts_base + src_rank * e_local + offs
+    vals = tl.load(remote_cnts_ptrs, mask=mask, other=0)
+    tl.store(local_expert_cnts + dev_id * e_local + offs, vals, mask=mask)
 
-    tl.atomic_add(cnt_exchange_sync, 1, sem="release", scope='sys')
+    remote_offsets_base_i64 = tl.load(offsets_bases + dev_id)
+    remote_offsets_base = tl.cast(remote_offsets_base_i64, tl.pointer_type(tl.int64))
+    off_val = tl.load(remote_offsets_base + src_rank)
+    tl.store(local_expert_offset_idxs + dev_id, off_val)
+    # maybe we dont need the lock here
+    #tl.atomic_add(cnt_exchange_sync, 1, sem="release", scope="sys")
 
-    ## Spin-wait till completion, required for correctness. ##
-    ws = tl.full([], world_size, dtype=tl.int32)
-    v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem='acquire', scope='sys')
-    tl.debug_barrier()
-    while v != ws:
-        v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem='acquire', scope='sys')
+    #ws = tl.full((), world_size, tl.int32)
+    #v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem="acquire", scope="sys")
+    #while v != ws:
+    #   v = tl.atomic_cas(cnt_exchange_sync, ws, ws, sem="acquire", scope="sys")
 
 ## TODO(ahangupta): if this consumes too much runtime, we can migrate this into
 ##                      a triton kernel as well.
@@ -304,22 +327,20 @@ def token_exchange_pull(
     ########################################
     ### These buffers are for READING ONLY. 
     ########################################
-    tokens, # [C, hidden_dim] -> symmetric memory.
-    read_meta, # [world_size, expert_pack] -> local memory.
-    write_meta, # [world_size, expert_pack] -> local memory.
-    local_expert_cnts, # [world_size, expert_pack] -> symmetric memory.
+    tokens_bases,    # [world_size] -> symmetric memory. int64
+    read_meta, # [world_size, expert_pack] -> local memory. int64
+    write_meta, # [world_size, expert_pack] -> local memory. int64
+    local_expert_cnts, # [world_size, expert_pack] -> local memory. int64
     ########################################
     ### These buffers are for WRITING ONLY. 
     ########################################
-    gathered_tokens, # [C', hidden_dim] -> local memory.
-    token_sync, # [world_size, expert_pack] -> local memory.
-    ## Extraneous bits of information.
-    heap_bases,
-    src_rank,
-    world_size,
-    e_local,
+    gathered_tokens, # [T_recv, hidden_dim] -> local memory.
+    token_sync, # [world_size, expert_pack] -> local memory. int32
+    src_rank: tl.constexpr,
+    world_size: tl.constexpr,
+    e_local: tl.constexpr,
     hidden_dim: tl.constexpr,
-    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     """
     This kernel physically exchanges tokens after the metadata exchange stage.
@@ -338,168 +359,349 @@ def token_exchange_pull(
         ##    over-provisioned.
         return 
 
-    read_meta_ptrs = tl.load(read_meta + dev_id * e_local + expert_id) 
-    write_meta_ptrs = tl.load(write_meta + dev_id * e_local + expert_id)
+    read_row = tl.load(read_meta + dev_id * e_local + expert_id) + offset
+    write_row = tl.load(write_meta + dev_id * e_local + expert_id) + offset
 
-    from_ptrs = read_meta_ptrs * hidden_dim + offset * hidden_dim + tl.arange(0, BLOCK_M)
-    to_ptrs = write_meta_ptrs * hidden_dim + offset * hidden_dim + tl.arange(0, BLOCK_M)
+    remote_tokens_base_i64 = tl.load(tokens_bases + dev_id)
+    remote_tokens_base = tl.cast(remote_tokens_base_i64, tl.pointer_type(tl.bfloat16))
 
-    for k in tl.range(tl.cdiv(hidden_dim, BLOCK_M)):
-        iris.get(
-            tokens + from_ptrs,
-            gathered_tokens + to_ptrs,
-            from_rank=src_rank,
-            to_rank=dev_id,
-            heap_bases=heap_bases,
-            mask=tl.arange(0, BLOCK_M)+k*BLOCK_M < hidden_dim
-        )
+    for k0 in tl.static_range(0, hidden_dim, BLOCK_K):
+        k = k0 + tl.arange(0, BLOCK_K)
+        mask = k < hidden_dim
 
-        from_ptrs += BLOCK_M
-        to_ptrs += BLOCK_M
+        src_ptrs = remote_tokens_base + read_row * hidden_dim + k
+        dst_ptrs = gathered_tokens + write_row * hidden_dim + k
 
+        vals = tl.load(src_ptrs, mask=mask, other=0)
+        tl.store(dst_ptrs, vals, mask=mask)
+
+   
     ## Now, we ring a bell to indicate completion. ##
-    tl.atomic_add(token_sync + dev_id * e_local + expert_id, 1, sem='release', scope='sys')
-
-"""
-@triton.jit
-def token_shuffle(
-    pca_cumsum_ptr, pca_ptr, ## Both of size: [E, world_size]
-    token_buffer_ptr, # Size: [E, world_size, mxa, hidden_dim]
-    output_buffer_ptr, # Size: [S, hidden_dim]
-    token_sync_ptr, # Size: [E] int32 
-    E: tl.constexpr, world_size: tl.constexpr,
-    mxa: tl.constexpr, hidden_dim: tl.constexpr
-    BLOCK_X: tl.contexpr  ## We have 1-d blocks only.
-):
-    """
-    #Triton kernel that reshuffles data post all-to-all (prior to expert compute) 
-    #to eliminate zero-padding.
-
-    #Args:
-    #    pca_cumsum_ptr (Tensor): [E, world_size]-sized physical counts array. 
-    #        pca_cumsum_ptr[i, j] = x means x tokens 
-    #    pca_ptr (Tensor): [E, world_size]-sized physical counts array.
-    #        pca_ptr[i, j] = x represents that x tokens are routed from device j
-    #        to expert i on the current rank.
-    #    token_buffer_ptr (Tensor): [E, world_size, capacity, hidden_dim]-sized tensor.
-    #        the output buffer that the all-to-all writes to.
-    #    token_sync_ptr (Tensor): [E]-sized tensor. These are synchronization variables
-    #        set by the prior all-to-all to ensure correctness.
-    #    E (int): number of *local* experts.
-    #    world_size (int): number of participating ranks.
-    #    mxa (int): maximum capaicty (2nd dimension of the token_buffer_ptr array).
-    #    hidden_dim (int): token hidden-dimensions.
-"""
-    expert = tl.program_id(0)
-    dev_id = tl.program_id(1)
-    token_id = tl.program_id(2)
-
-    ## We predicate some blocks off immediately. ##
-    num_tokens = tl.load(pca_ptr + (expert * world_size + dev_id).to(tl.int64))
-
-    if num_tokens < token_id:
-        return ## Immediately terminate.
-
-    ## Else, we have a non-zero token to shift to the output buffer. ##
-
-    ## We have to wait on the prior shmem puts to finish successfuly. 
-    while tl.load(token_sync_ptr + expert.to(tl.int64), volatile=True) < world_size:
-        pass 
-    
-    ## We loop over the hidden dimension and shift a token over to the output buffer. 
-    inp_ptrs = expert * world_size * mxa * hidden_dim + dev_id *  mxa * hidden_dim + token_id * hidden_dim + tl.arange(BLOCK_X)
-    cum_summed_prev = tl.load(pca_cumsum_ptr + (expert * world_size + dev_id).to(tl.int64))
-    packed_ptrs = (cum_summed_prev + token_id) * hidden_dim
-    for _ in tl.range(tl.cdiv(hidden_dim, BLOCK_X)):
-
-        tkns = tl.load(token_buffer_ptr + inp_ptrs, mask=0)
-        tl.store(output_buffer_ptr + packed_ptrs, tkns)
-
-        packed_ptrs += BLOCK_X
-        inp_ptrs += BLOCK_X
+    #tl.atomic_add(token_sync + dev_id * e_local + expert_id, 1, sem='release', scope='sys')
 
 @triton.jit
 def grouped_gemm(
-    # device tensor of matrices pointers
-    token_ptrs, # Shape: [S, hidden_dim].
-    expert_weights, # Shape: [hidden_dim, expert_hidden_dim]
-    output_ptrs, # Shape: [S, expert_hidden_dim]
-    expert_tkn_cnt_ptr, # Shape: [E], token count per expert.
-    # number of virtual SM
-    NUM_SM: tl.constexpr,
-    # number of gemms -> equivalent to local expert count.
-    expert_cnt: tl.contexpr,
+    token_ptrs,            # [S, H]
+    expert_weights_ptr,    # [E, H, N]
+    output_ptrs,           # [S, N]
+    expert_tkn_cnt_ptr,    # [E]
+    expert_offsets_ptr,    # [E]
+    pid_to_expert_ptr,     # [total_tiles]
+    pid_to_m_ptr,          # [total_tiles]
+    pid_to_n_ptr,          # [total_tiles]
+    NUM_SM: tl.constexpr,  # unused for now
+    expert_cnt: tl.constexpr,
     hidden_dim: tl.constexpr,
-    expert_hidden_dim: tl.contexpr,
-    # tile sizes
+    expert_hidden_dim: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    """
-    #This kernel implements a grouped-gemm on the input token-buffers.
+    pid = tl.program_id(0)
 
-    #Args:
-    #    token_ptrs (Tensor): [S, hidden_dim]-sized array. S is the packed
-    #        number of tokens (no zero-padding) post data-shuffling.
-    #    expert_weights (Tensor): [hidden_dim, expert_hidden_dim]-sized array. 
-    #        This represents each experts' weights.
-    #    output_ptrs (Tensor): [S, expert_hidden_dim]-sized array. Buffer to store
-    #        the results of processing the input tokens with expert weights.
-    #    expert_tkn_cnt_ptr (Tensor): [E]-sized array representing the tokens routed 
-    #        to expert i on the current rank. 
-        
-    #    Rest of the arguments are self-explanatory.
-"""
-    tile_idx = tl.program_id(0)
-    last_problem_end = 0
-    for g in range(expert_cnt):
-        # get the gemm size of the current problem
-        gm = tl.load(expert_tkn_cnt_ptr + g)
-        gn = expert_hidden_dim
-        gk = hidden_dim
-        num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)
-        num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)
-        num_tiles = num_m_tiles * num_n_tiles
-        # iterate through the tiles in the current gemm problem
-        while (tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles):
-            # pick up a tile from the current gemm problem
-            k = gk
-            # figure out tile coordinates
-            tile_idx_in_gemm = tile_idx - last_problem_end
-            tile_m_idx = tile_idx_in_gemm // num_n_tiles
-            tile_n_idx = tile_idx_in_gemm % num_n_tiles
+    # O(1) schedule look up
+    g = tl.load(pid_to_expert_ptr + pid).to(tl.int32)
+    g64 = g.to(tl.int64)
+    tile_m_idx = tl.load(pid_to_m_ptr + pid).to(tl.int32)
+    tile_n_idx = tl.load(pid_to_n_ptr + pid).to(tl.int32)
 
-            # do regular gemm here
-            offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-            offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-            offs_k = tl.arange(0, BLOCK_SIZE_K)
-            a_ptrs = token_ptrs + offs_am[:, None] * hidden_dim + offs_k[None, :]
-            b_ptrs = b_ptr + offs_k[:, None] * expert_hidden_dim + offs_bn[None, :]
-            accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-            for kk in range(0, tl.cdiv(k, BLOCK_SIZE_K)):
-                # hint to Triton compiler to do proper loop pipelining
-                tl.multiple_of(a_ptrs, [16, 16])
-                tl.multiple_of(b_ptrs, [16, 16])
-                # assume full tile for now
-                a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs)
-                accumulator += tl.dot(a, b)
-                a_ptrs += BLOCK_SIZE_K
-                b_ptrs += BLOCK_SIZE_K * ldb
-            c = accumulator.to(output_ptrs.dtype.element_ty)
+    gm = tl.load(expert_tkn_cnt_ptr + g).to(tl.int64)
+    token_base = tl.load(expert_offsets_ptr + g).to(tl.int64)
 
-            offs_cm = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-            offs_cn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-            c_ptrs = c_ptr + expert_hidden_dim * offs_cm[:, None] + offs_cn[None, :]
+    offs_m = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-            # assumes full tile for now
-            tl.store(c_ptrs, c)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-            # go to the next tile by advancing NUM_SM
-            tile_idx += NUM_SM
+    for k0 in range(0, hidden_dim, BLOCK_SIZE_K):
+        k_idx = k0 + offs_k
 
-        # get ready to go to the next gemm problem
-        last_problem_end = last_problem_end + num_tiles
-    """
+        a_ptrs = token_ptrs + (token_base + offs_m)[:, None] * hidden_dim + k_idx[None, :]
+        b_ptrs = (
+            expert_weights_ptr
+            + g64 * hidden_dim * expert_hidden_dim
+            + k_idx[:, None] * expert_hidden_dim
+            + offs_n[None, :]
+        )
 
+        a_mask = (offs_m[:, None] < gm) & (k_idx[None, :] < hidden_dim)
+        b_mask = (k_idx[:, None] < hidden_dim) & (offs_n[None, :] < expert_hidden_dim)
+
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc += tl.dot(a, b)
+
+    c = acc.to(output_ptrs.dtype.element_ty)
+
+    c_ptrs = output_ptrs + (token_base + offs_m)[:, None] * expert_hidden_dim + offs_n[None, :]
+    c_mask = (offs_m[:, None] < gm) & (offs_n[None, :] < expert_hidden_dim)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+@triton.jit
+def grouped_gemm_rect(
+    tokens_ptr,           # [S, H]
+    weights_ptr,          # [E, H, N]
+    out_ptr,              # [S, N]
+    expert_tkn_cnt,       # [E]
+    expert_offsets,       # [E]
+    expert_cnt: tl.constexpr,
+    hidden_dim: tl.constexpr,
+    expert_hidden_dim: tl.constexpr,
+    max_m_tiles: tl.constexpr,
+    num_n_tiles: tl.constexpr,
+    NUM_SM: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    tiles_per_expert = max_m_tiles * num_n_tiles
+    g = pid // tiles_per_expert
+    rem = pid % tiles_per_expert
+    tile_m_idx = rem // num_n_tiles
+    tile_n_idx = rem % num_n_tiles
+
+    if g >= expert_cnt:
+        return
+
+    gm = tl.load(expert_tkn_cnt + g)
+    if tile_m_idx * BLOCK_SIZE_M >= gm:
+        return
+
+    g64 = g.to(tl.int64)
+    token_base = tl.load(expert_offsets + g).to(tl.int64)
+
+    offs_m_local = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_m = (token_base + offs_m_local).to(tl.int64)
+    offs_n = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    k = 0
+    while k < hidden_dim:
+        k_mask = (k + offs_k) < hidden_dim
+        m_mask = offs_m < (token_base + gm)
+        n_mask = offs_n < expert_hidden_dim
+
+        # A: tokens [S, H]
+        a_ptrs = tokens_ptr + offs_m[:, None] * hidden_dim + (k + offs_k)[None, :]
+        a = tl.load(a_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+
+        # B: weights [E, H, N]
+        # weights for expert g
+        b_ptrs = (
+            weights_ptr
+            + g64 * hidden_dim * expert_hidden_dim
+            + (k + offs_k)[:, None] * expert_hidden_dim
+            + offs_n[None, :]
+        )
+        b = tl.load(b_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+        acc += tl.dot(a, b)
+        k += BLOCK_SIZE_K
+
+    out_ptrs = out_ptr + offs_m[:, None] * expert_hidden_dim + offs_n[None, :]
+    out_mask = (offs_m < (token_base + gm))[:, None] & (offs_n < expert_hidden_dim)[None, :]
+    tl.store(out_ptrs, acc.to(tl.bfloat16), mask=out_mask)
+
+# new gather overlap kernel
+@triton.jit
+def token_exchange_pull_tiles(
+    tokens_bases,            # [W] int64
+    read_meta,               # [W, E]
+    write_meta,              # [W, E]
+    local_expert_cnts,       # [W, E]
+    gathered_tokens,         # [S, H]
+    ready,                   # [E, W, MAX_TILES]
+    src_rank,
+    world_size: tl.constexpr,
+    e_local: tl.constexpr,
+    hidden_dim: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    max_tiles: tl.constexpr,
+):
+    src = tl.program_id(0)
+    e = tl.program_id(1)
+    tm = tl.program_id(2)
+
+    cnt = tl.load(local_expert_cnts + src * e_local + e)
+    row0 = tm * BLOCK_SIZE_M
+    if row0 >= cnt:
+        return
+
+    read_base = tl.load(read_meta + src * e_local + e)
+    write_base = tl.load(write_meta + src * e_local + e)
+
+    offs_m = row0 + tl.arange(0, BLOCK_SIZE_M)
+    m_mask = offs_m < cnt
+
+    # Cast the remote base to a pointer type instead of treating it as int64.
+    remote_tokens_base = tl.load(tokens_bases + src).to(tl.pointer_type(tl.bfloat16))
+
+    k0 = 0
+    while k0 < hidden_dim:
+        offs_k = k0 + tl.arange(0, BLOCK_SIZE_K)
+        k_mask = offs_k < hidden_dim
+
+        src_ptrs = remote_tokens_base + ((read_base + offs_m)[:, None] * hidden_dim + offs_k[None, :])
+        dst_ptrs = gathered_tokens + ((write_base + offs_m)[:, None] * hidden_dim + offs_k[None, :])
+
+        vals = tl.load(src_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        tl.store(dst_ptrs, vals, mask=m_mask[:, None] & k_mask[None, :])
+
+        k0 += BLOCK_SIZE_K
+
+    # ready[e, src, tm] = 1
+    ready_ptr = ready + (e * world_size + src) * max_tiles + tm
+    tl.store(ready_ptr, 1)
+
+@triton.jit
+def grouped_gemm_overlap(
+    tokens_ptr,           # [S, H]
+    weights_ptr,          # [E, H, N]
+    out_ptr,              # [S, N]
+    counts_by_src,        # [W, E]
+    write_meta,           # [W, E]
+    ready,                # [E, W, MAX_TILES]
+    spin_iters,           # [grid] int32
+    wait_cycles,          # [grid] int64
+    prog_pid,             # [grid] int32
+    prog_cnt,             # [grid] int32
+    diag_timeout_flag,    # [1] int32
+    diag_timeout_pid,     # [1] int32
+    diag_timeout_e,       # [1] int32
+    diag_timeout_src,     # [1] int32
+    diag_timeout_tm,      # [1] int32
+    diag_timeout_cnt,     # [1] int32
+    world_size: tl.constexpr,
+    expert_cnt: tl.constexpr,
+    hidden_dim: tl.constexpr,
+    expert_hidden_dim: tl.constexpr,
+    max_m_tiles: tl.constexpr,
+    num_n_tiles: tl.constexpr,
+    ENABLE_PROBES: tl.constexpr,
+    ENABLE_WAIT_CYCLES: tl.constexpr,
+    DIAG_MAX_SPIN: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    tiles_per_es = max_m_tiles * num_n_tiles
+    es_idx = pid // tiles_per_es
+    rem = pid % tiles_per_es
+
+    e = es_idx // world_size
+    src = es_idx % world_size
+    tm = rem // num_n_tiles
+    tn = rem % num_n_tiles
+
+    if e >= expert_cnt:
+        if ENABLE_PROBES:
+            tl.store(prog_pid + pid, pid)
+            tl.store(prog_cnt + pid, -1)
+            tl.store(spin_iters + pid, -1)
+            tl.store(wait_cycles + pid, -1)
+        return
+
+    cnt = tl.load(counts_by_src + src * expert_cnt + e)
+    row0 = tm * BLOCK_SIZE_M
+    if row0 >= cnt:
+        if ENABLE_PROBES:
+            tl.store(prog_pid + pid, pid)
+            tl.store(prog_cnt + pid, cnt)
+            tl.store(spin_iters + pid, -1)
+            tl.store(wait_cycles + pid, -1)
+        return
+
+    # wait exactly once on ready[e, src, tm]
+    ready_ptr = ready + (e * world_size + src) * max_m_tiles + tm
+    t_arrive = tl.full((), 0, dtype=tl.int64)
+    if ENABLE_PROBES and ENABLE_WAIT_CYCLES:
+        t_arrive = tl.inline_asm_elementwise(
+            asm="s_memrealtime $0",
+            constraints="=s",
+            args=[],
+            dtype=tl.int64,
+            is_pure=False,
+            pack=1,
+        )
+    if DIAG_MAX_SPIN == 0:
+        spin = tl.full((), 0, dtype=tl.int32)
+        flag = tl.load(ready_ptr)
+        while flag == 0:
+            flag = tl.load(ready_ptr)
+            spin += 1
+    else:
+        spin = tl.full((), 0, dtype=tl.int32)
+        timed_out = tl.full((), 0, dtype=tl.int32)
+        flag = tl.load(ready_ptr)
+        while (flag == 0) & (timed_out == 0):
+            flag = tl.load(ready_ptr)
+            spin += 1
+            if spin >= DIAG_MAX_SPIN:
+                claimed = tl.atomic_cas(diag_timeout_flag, 0, 1)
+                if claimed == 0:
+                    tl.store(diag_timeout_pid, pid)
+                    tl.store(diag_timeout_e, e)
+                    tl.store(diag_timeout_src, src)
+                    tl.store(diag_timeout_tm, tm)
+                    tl.store(diag_timeout_cnt, cnt)
+                timed_out = 1
+    if ENABLE_PROBES:
+        elapsed = tl.full((), -1, dtype=tl.int64)
+        if ENABLE_WAIT_CYCLES:
+            t_ready = tl.inline_asm_elementwise(
+                asm="s_memrealtime $0",
+                constraints="=s",
+                args=[],
+                dtype=tl.int64,
+                is_pure=False,
+                pack=1,
+            )
+            elapsed = t_ready - t_arrive
+        tl.store(spin_iters + pid, spin)
+        tl.store(wait_cycles + pid, elapsed)
+        tl.store(prog_pid + pid, pid)
+        tl.store(prog_cnt + pid, cnt)
+
+    e64 = e.to(tl.int64)
+    token_base = tl.load(write_meta + src * expert_cnt + e).to(tl.int64)
+
+    offs_m = (token_base + row0 + tl.arange(0, BLOCK_SIZE_M)).to(tl.int64)
+    offs_n = tn * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    # Keep this mask outside the K loop; it is invariant for this program.
+    m_mask = (row0 + tl.arange(0, BLOCK_SIZE_M)) < cnt
+    n_mask = offs_n < expert_hidden_dim
+
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    k0 = 0
+    while k0 < hidden_dim:
+        offs_k = k0 + tl.arange(0, BLOCK_SIZE_K)
+        k_mask = offs_k < hidden_dim
+
+        a_ptrs = tokens_ptr + offs_m[:, None] * hidden_dim + offs_k[None, :]
+        b_ptrs = (
+            weights_ptr
+            + e64 * hidden_dim * expert_hidden_dim
+            + offs_k[:, None] * expert_hidden_dim
+            + offs_n[None, :]
+        )
+
+        a = tl.load(a_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        b = tl.load(b_ptrs, mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+
+        acc += tl.dot(a, b)
+        k0 += BLOCK_SIZE_K
+
+    out_ptrs = out_ptr + offs_m[:, None] * expert_hidden_dim + offs_n[None, :]
+    out_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(out_ptrs, acc.to(tl.bfloat16), mask=out_mask)

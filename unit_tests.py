@@ -9,6 +9,7 @@ from layers.all_to_all import custom_a2a
 from layers.all_to_all_gather import gather_a2a
 # 4debug
 from layers.all_to_all import _LAST_DBG
+from torch.distributed import _symmetric_memory as symmem
 
 #from .layers.token_shuffle import shuffle
 #from .layers.expert import expert
@@ -18,6 +19,51 @@ from baseline import exchange_counts_a2a, exchange_payload_a2a, init_baseline_bu
 
 # 4 debug only
 import time
+
+## small helpers from benchmark ##
+def _as_cuda_i64_ptr_tensor(ptrs, device):
+    return torch.tensor(list(ptrs), dtype=torch.int64, device=device)
+
+def _alloc_symm_gather_buffers(
+    world_size: int,
+    e_local: int,
+    total_rows: int,
+    hidden_dim: int,
+    token_dtype: torch.dtype,
+    send_counts: torch.Tensor,
+    dst_offsets: torch.Tensor,
+    tokens: torch.Tensor,
+    device: torch.device,
+):
+    cnts = symmem.empty((world_size, e_local), dtype=torch.int64, device=device)
+    cnts_hdl = symmem.rendezvous(cnts, group=dist.group.WORLD)
+    cnts_bases = _as_cuda_i64_ptr_tensor(cnts_hdl.buffer_ptrs, device)
+
+    offsets = symmem.empty((world_size,), dtype=torch.int64, device=device)
+    offsets_hdl = symmem.rendezvous(offsets, group=dist.group.WORLD)
+    offsets_bases = _as_cuda_i64_ptr_tensor(offsets_hdl.buffer_ptrs, device)
+
+    symm_tokens = symmem.empty((total_rows, hidden_dim), dtype=token_dtype, device=device)
+    tokens_hdl = symmem.rendezvous(symm_tokens, group=dist.group.WORLD)
+    tokens_bases = _as_cuda_i64_ptr_tensor(tokens_hdl.buffer_ptrs, device)
+
+    cnts.copy_(send_counts.to(torch.int64))
+    offsets.copy_(dst_offsets.to(torch.int64))
+    symm_tokens.copy_(tokens)
+
+    return {
+        "cnts": cnts,
+        "offsets": offsets,
+        "tokens": symm_tokens,
+        "cnts_bases": cnts_bases,
+        "offsets_bases": offsets_bases,
+        "tokens_bases": tokens_bases,
+        "cnts_hdl": cnts_hdl,
+        "offsets_hdl": offsets_hdl,
+        "tokens_hdl": tokens_hdl,
+    }
+
+
 def _spin_wait_counts(cb, world_size, timeout_s=10.0):
     t0 = time.time()
     while True:
@@ -89,16 +135,14 @@ def _init_dist_tcp(rank: int, world_size: int) -> None:
 
 def _worker(local_rank: int, world_size: int) -> None:
     _init_dist_tcp(local_rank, world_size)
-    shmem = _get_shmem()  # init once per process
     print(f"[rank{local_rank}] init ok, cuda={torch.cuda.current_device()}", flush=True)
     try:
-        # run tests ONLY inside workers
         print(f"[rank{local_rank}] begin test e_local=2", flush=True)
-        test_custom_a2a(shmem, e_local=2, hidden_dim=128, cap=32)
+        test_custom_a2a(e_local=2, hidden_dim=128, cap=32)
         print(f"[rank{local_rank}] done  test e_local=2", flush=True)
 
         print(f"[rank{local_rank}] begin test e_local=4", flush=True)
-        test_custom_a2a(shmem, e_local=4, hidden_dim=256, cap=16)
+        test_custom_a2a(e_local=4, hidden_dim=256, cap=16)
         print(f"[rank{local_rank}] done  test e_local=4", flush=True)
 
         if local_rank == 0:
@@ -121,9 +165,6 @@ def _require_dist():
     assert torch.cuda.is_available(), "CUDA is required for this test."
 
 
-def _get_shmem():
-    heap_size = int(os.environ.get("IRIS_HEAP_SIZE", str(1 << 30)))
-    return iris.iris(heap_size)
 
 def gen_gemm_input(num_local_experts, token_hid_dim, expert_hid_dim):
     expert_token_cnt = torch.randint(low=0, high=100, size=(num_local_experts,))
@@ -136,7 +177,7 @@ def gen_gemm_input(num_local_experts, token_hid_dim, expert_hid_dim):
 
 
 
-def test_custom_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 32, threshold: float = 1e-2) -> bool:
+def test_custom_a2a(e_local: int = 2, hidden_dim: int = 128, cap: int = 32, threshold: float = 1e-2) -> bool:
     """
        Routing pattern:
       Each src sends exactly `cap` rows to every (dst, local_expert).
@@ -252,7 +293,7 @@ def test_gemm(total_expert_cnt, token_hid_dim, expert_hid_dim):
     return is_correct(custom_output, torch.stack(torch_out), 1e-2)
 
 
-def test_gather_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 32, threshold: float = 1e-2) -> bool:
+def test_gather_a2a(e_local: int = 2, hidden_dim: int = 128, cap: int = 32, threshold: float = 1e-2) -> bool:
     """
     Test the gather (pull) all-to-all against the PyTorch baseline.
 
@@ -281,24 +322,35 @@ def test_gather_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 3
                 tokens[row].fill_(val)
 
     # --- Allocate symmetric memory buffers for the gather a2a. ---
-    # cnts and offsets must live in symmetric memory so other ranks can read them.
-    shmem_cnts = shmem.zeros((world_size, e_local), dtype=torch.int64, device="cuda")
-    shmem_offsets = shmem.zeros((world_size,), dtype=torch.int64, device="cuda")
-    shmem_tokens = shmem.zeros((total_rows, hidden_dim), dtype=tokens.dtype, device="cuda")
-    heap_bases = shmem.get_heap_bases()
+   
+    # Simple one in pytorch
+    symm = _alloc_symm_gather_buffers(
+        world_size,
+        e_local,
+        total_rows,
+        hidden_dim,
+        tokens.dtype,
+        send_counts,
+        dst_offsets,
+        tokens,
+        torch.device("cuda"),
+    )
 
-    # Populate symmetric buffers with this rank's data.
-    shmem_cnts.copy_(send_counts.to(torch.int64))
-    shmem_offsets.copy_(dst_offsets.to(torch.int64))
-    shmem_tokens.copy_(tokens)
-
-    # Ensure all ranks have written their symmetric buffers before pulling.
-    shmem.barrier()
+    dist.barrier()
 
     # --- Run custom gather a2a. ---
-    gathered = gather_a2a(shmem_cnts, shmem_offsets, heap_bases, e_local, shmem_tokens)
+    gathered = gather_a2a(
+        symm["cnts"],
+        symm["offsets"],
+        symm["tokens"],
+        symm["cnts_bases"],
+        symm["offsets_bases"],
+        symm["tokens_bases"],
+        e_local,
+    )
+
     torch.cuda.synchronize()
-    shmem.barrier()
+    dist.barrier()
 
     # --- Run baseline a2a to get expected result. ---
     # exchange_counts_a2a gives us recv_counts[src, e] = tokens src sends to our expert e.
@@ -350,11 +402,10 @@ def test_gather_a2a(shmem, e_local: int = 2, hidden_dim: int = 128, cap: int = 3
 
 def _worker_gather(local_rank: int, world_size: int) -> None:
     _init_dist_tcp(local_rank, world_size)
-    shmem = _get_shmem()
     print(f"[rank{local_rank}] init ok, cuda={torch.cuda.current_device()}", flush=True)
     try:
-        test_gather_a2a(shmem, e_local=16, hidden_dim=128, cap=32)
-        test_gather_a2a(shmem, e_local=16, hidden_dim=256, cap=16)
+        test_gather_a2a(e_local=16, hidden_dim=128, cap=32)
+        test_gather_a2a(e_local=16, hidden_dim=256, cap=16)
         if local_rank == 0:
             print("All gather_a2a tests finished")
     finally:
